@@ -862,6 +862,62 @@ function registerCrawlRoutes(app, ctx) {
       next(err);
     }
   });
+
+  // POST /api/crawl/ai-expand {keyword, region, count?} → DeepSeek 生成搜索变体词并立即执行
+  // 用于发现层：基础关键词命中为0时，用 AI 变体词重新搜索，提升新政策发现量
+  app.post('/api/crawl/ai-expand', requireUser, async (req, res, next) => {
+    try {
+      const { keyword, region, count = 5 } = req.body || {};
+      if (!keyword || !region) {
+        return res.status(400).json({ statusCode: 400, message: 'keyword 与 region 必填', error: 'Bad Request' });
+      }
+      const crawler = require('../../policy-api/src/crawler');
+      // 1. 先用基础词搜一次
+      const baseItems = await crawler.crawlPolicies({ keyword, region }).catch(() => []);
+      // 2. 若命中为0，用 DeepSeek 生成变体词再搜
+      let expandedTerms = [];
+      let extraItems = [];
+      if (baseItems.length === 0 && llm.llmEnabled()) {
+        const terms = await llm.aiExpandSearchTerms({ province: region, category: keyword, count }).catch(() => null);
+        if (terms && terms.length > 0) {
+          expandedTerms = terms;
+          for (const term of terms) {
+            const ext = await crawler.crawlPolicies({ keyword: term, region }).catch(() => []);
+            extraItems = extraItems.concat(ext);
+          }
+        }
+      }
+      // 3. 合并结果并按 url 去重
+      const allItems = [...baseItems, ...extraItems];
+      const seen = new Set();
+      const uniqueItems = [];
+      for (const it of allItems) {
+        if (it.url && !seen.has(it.url)) { seen.add(it.url); uniqueItems.push(it); }
+      }
+      // 4. 写入待确认池
+      const list = crawlList();
+      let added = 0;
+      for (const it of uniqueItems) {
+        if (!list.some((c) => c.url && c.url === it.url)) {
+          list.push(it);
+          added += 1;
+        }
+      }
+      if (added > 0) db.save();
+      res.json({
+        ok: true,
+        baseHits: baseItems.length,
+        expandedTerms: expandedTerms.length,
+        extraHits: extraItems.length,
+        totalUnique: uniqueItems.length,
+        addedToQueue: added,
+        aiEnabled: llm.llmEnabled(),
+        terms: expandedTerms,
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
 }
 
 module.exports = { registerCrawlRoutes, classifyCategory, buildWriteFields, matchStatus };

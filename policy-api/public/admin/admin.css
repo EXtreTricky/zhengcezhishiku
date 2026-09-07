@@ -80,6 +80,11 @@ html[data-theme="dark"] .iconbtn .i-sun{display:none}
 .btn-primary{background:var(--brand);color:#fff;box-shadow:0 6px 16px -8px rgba(52,89,255,.8)}
 .btn-primary:hover{background:var(--brand-strong)}
 .btn-primary:disabled{opacity:.55;cursor:not-allowed;box-shadow:none}
+.btn-accent{background:var(--violet);color:#fff;box-shadow:0 6px 16px -8px rgba(124,92,255,.8)}
+.btn-accent:hover{background:var(--violet);filter:brightness(1.1)}
+.btn-accent:disabled{opacity:.55;cursor:not-allowed;box-shadow:none}
+.btn-secondary{background:var(--surface-2);color:var(--ink);border:1px solid var(--hair-2)}
+.btn-secondary:hover{background:var(--hair);color:var(--ink)}
 .btn-sm{height:26px;padding:0 11px;font-size:12px;border-radius:7px}
 .btn-block{width:100%;margin-top:12px}
 .pill{display:inline-flex;align-items:center;gap:7px;height:29px;padding:0 12px;border-radius:15px;font-size:12px;font-weight:550}

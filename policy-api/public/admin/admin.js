@@ -659,6 +659,37 @@ document.addEventListener('DOMContentLoaded', () => {
       $('#btn-run').disabled = false;
     }
   });
+  // AI 智能发现按钮
+  $('#btn-ai-expand').addEventListener('click', async () => {
+    if (S.runBusy || !needAuth()) return;
+    const region = $('#run-region').value || '全国';
+    const category = $('#run-category').value || '最低工资';
+    S.runBusy = true;
+    $('#btn-ai-expand').disabled = true;
+    $('#run-state').textContent = 'AI 生成变体词并补搜中…';
+    const logEl = $('#run-log');
+    logEl.classList.remove('hidden');
+    logEl.textContent = '';
+    try {
+      const r = await api('/api/crawl/ai-expand', {
+        method: 'POST',
+        body: { keyword: category, region, count: 5 },
+      });
+      const terms = (r.terms || []).join('\n');
+      logEl.textContent =
+        `基础词「${category}」命中 ${r.baseHits} 条\n` +
+        `AI 生成 ${r.expandedTerms} 个变体词\n` +
+        `变体词额外命中 ${r.extraHits} 条\n` +
+        `唯一条目 ${r.totalUnique} 条，新入池 ${r.addedToQueue} 条\n\n` +
+        (terms ? `变体词列表：\n${terms}` : '（未生成变体词或基础词已有命中）');
+      $('#run-state').textContent = '✓ AI 智能发现完成';
+      await loadMatrix();
+    } catch (e) {
+      $('#run-state').textContent = 'AI 发现失败：' + e.message;
+    }
+    S.runBusy = false;
+    $('#btn-ai-expand').disabled = false;
+  });
   $('#btn-confirm').addEventListener('click', confirmWrite);
   $('#btn-ignore').addEventListener('click', ignoreItem);
   // 分组 tab

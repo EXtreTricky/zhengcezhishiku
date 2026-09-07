@@ -518,6 +518,46 @@ async function remoteReview(mode, payload) {
   });
 }
 
+/**
+ * AI 搜索词扩展：为指定省份+政策类别生成 N 个变体搜索词
+ * 用于发现层补充：当基础关键词命中为0时，用变体词重新搜索
+ * 失败返回 null
+ */
+async function aiExpandSearchTerms({ province, category, count = 5 }) {
+  if (!llmEnabled()) return null;
+  if (!province || !category) return null;
+  // 类别 → 政策领域中文描述映射（让 LLM 理解语义）
+  const CATEGORY_MEANING = {
+    '最低工资': '月最低工资标准、非全日制小时工资标准',
+    '平均工资': '全口径城镇单位就业人员平均工资、社平工资',
+    '公积金': '住房公积金缴存基数上下限、缴存比例',
+    '年金': '企业年金、职业年金、税收优惠政策',
+    '大病医疗': '大病医疗保险、医疗互助、个税专项扣除',
+    '高温津贴': '高温津贴标准、防暑降温费、高温作业劳动保护',
+    '残疾职工': '残疾人就业保障金、残保金、残疾人就业优惠',
+    '婚育相关': '产假、陪产假、育儿假、哺乳假、婚假天数',
+    '病假工资': '病假工资标准、医疗期工资、疾病休假待遇',
+  };
+  const meaning = CATEGORY_MEANING[category] || category;
+  const sample = await chatJSON({
+    system:
+      '你是中国政府政策搜索引擎优化专家。只输出 JSON 数组，不要任何多余文字。',
+    user:
+      `省份：${province}\n政策类别：${category}（${meaning}）\n\n` +
+      `请生成 ${count} 个不同的百度搜索查询词，用于在政府网站搜索最新政策文件。` +
+      `要求：` +
+      `1) 每个词长度 ≤ 30 字；2) 覆盖不同表达习惯（如"通知"、"标准"、"调整"、"印发"等）；` +
+      `3) 优先考虑 2025-2026 年的最新政策；4) 不要与基础词 "${province} ${category}" 重复。` +
+      `输出格式：{"queries":["词1", "词2", ...]}`,
+  });
+  if (!sample || !Array.isArray(sample.queries)) return null;
+  // 过滤：去重、长度检查、去除明显无效词
+  const valid = [...new Set(sample.queries)]
+    .filter((q) => typeof q === 'string' && q.trim().length >= 3 && q.trim().length <= 30)
+    .slice(0, count);
+  return valid;
+}
+
 module.exports = {
   aiReviewModification,
   verifyIntake,
@@ -533,4 +573,5 @@ module.exports = {
   suggestTableValues,
   regexSuggestColumns,
   aiSuggestColumns,
+  aiExpandSearchTerms,
 };

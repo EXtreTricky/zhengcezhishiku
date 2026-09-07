@@ -30,6 +30,7 @@ try {
 } catch (_) {}
 
 const db = require('../src/db');
+const llm = require('../src/llm');
 
 // 核心省清单（正式库里的主要覆盖对象；可在此增删）
 const REGIONS = ['全国', '北京', '上海', '广东', '江苏', '浙江', '山东', '四川', '湖北', '河南', '福建', '湖南', '河北', '天津', '重庆', '安徽', '江西', '陕西', '辽宁', '黑龙江'];
@@ -123,11 +124,29 @@ async function runBatch({ limit, region, category, all }) {
   let hits = 0;
   let added = 0;
   let failed = 0;
+  let aiExpanded = 0; // 统计 AI 扩了多少次
   for (let i = 0; i < tasks.length; i++) {
     const t = tasks[i];
     const label = `[${i + 1}/${tasks.length}] ${t.region} × ${t.keyword}`;
     try {
-      const items = await crawler.crawlPolicies({ keyword: t.keyword, region: t.region });
+      let items = await crawler.crawlPolicies({ keyword: t.keyword, region: t.region });
+      // AI 扩展：基础词命中为0时，用 DeepSeek 生成变体词重新搜索（最多 2 轮）
+      let expanded = false;
+      if (items.length === 0 && llm.llmEnabled()) {
+        const terms = await llm.aiExpandSearchTerms({ province: t.region, category: t.keyword, count: 3 }).catch(() => null);
+        if (terms && terms.length > 0) {
+          console.log(`[AI] ${label} 基础词无命中，尝试 ${terms.length} 个变体词...`);
+          for (const term of terms) {
+            const extItems = await crawler.crawlPolicies({ keyword: term, region: t.region }).catch(() => []);
+            items = items.concat(extItems);
+            if (extItems.length > 0) {
+              console.log(`[AI] 变体词「${term}」命中 ${extItems.length} 条`);
+            }
+          }
+          expanded = true;
+          aiExpanded += terms.length;
+        }
+      }
       let addN = 0;
       for (const it of items) {
         if (it.url && existingUrls.has(it.url)) continue;
@@ -144,7 +163,8 @@ async function runBatch({ limit, region, category, all }) {
       t.lastRun = new Date().toISOString();
       t.hits = items.length;
       t.added = addN;
-      console.log(`${label} → 命中 ${items.length} 条，新入池 ${addN} 条`);
+      const aiTag = expanded ? ' [AI扩词]' : '';
+      console.log(`${label} → 命中 ${items.length} 条，新入池 ${addN} 条${aiTag}`);
     } catch (err) {
       failed += 1;
       t.status = 'error';
@@ -156,7 +176,7 @@ async function runBatch({ limit, region, category, all }) {
     if (i < tasks.length - 1) await sleep(1200); // 防反爬限速
   }
   const remaining = ensureTasks().filter((t) => t.status !== 'done').length;
-  process.stdout.write('\n__RESULT__' + JSON.stringify({ ok: true, done: tasks.length, hits, added, failed, remaining }));
+  process.stdout.write('\n__RESULT__' + JSON.stringify({ ok: true, done: tasks.length, hits, added, failed, remaining, aiExpanded }));
 }
 
 function parseArgs() {
