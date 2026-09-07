@@ -353,19 +353,19 @@ async function discoverBySearch({ keyword, region }) {
   const prevYear = year - 1;
   const regionPart = region === '全国' ? '' : region;
 
-  // 多路搜索计划：提高命中率（DDG 国内超时，改用更多 Bing 变体）
+  // 多路搜索计划：提高命中率（DDG 国内超时，改用更多 Bing 变体 + 360 搜索）
   const searchPlan = [
-    // Bing 搜索策略（6路，覆盖不同表达）
+    // Bing 搜索策略（10路，覆盖不同表达）
     { engine: 'bing', q: `${regionPart} ${keyword} ${year}`.trim() },
     { engine: 'bing', q: `${keyword} 标准 调整 ${year} site:gov.cn` },
     { engine: 'bing', q: `${regionPart} ${keyword} 通知印发 ${year}`.trim() },
     { engine: 'bing', q: `${keyword} ${prevYear}-${year} site:gov.cn` },
     { engine: 'bing', q: `${regionPart} ${keyword} 公布 ${year}`.trim() },
     { engine: 'bing', q: `${keyword} 最新文件 site:gov.cn` },
-
-    // 备用搜索引擎（360搜索）
     { engine: 'bing', q: `site:gov.cn ${keyword} ${regionPart} ${year}`.trim() },
-    { engine: 'bing', q: `${keyword} 人社部 site:sohu.com` },
+    { engine: 'bing', q: `${keyword} 施行 ${year}` },
+    { engine: 'bing', q: `${regionPart} ${keyword} 修订 印发` },
+    { engine: 'bing', q: `${keyword} 发布 site:gov.cn` },
   ];
 
   // 1. 搜索发现：gov.cn 政策库 API 为主力（稳定 JSON），百度/bing SERP 为补充（可能抖动）
@@ -386,14 +386,14 @@ async function discoverBySearch({ keyword, region }) {
         return [];
       });
     } else if (engine === 'bing') {
-      results = await bingSearch(q, 8).catch((e) => {
+      results = await bingSearch(q, 10).catch((e) => {
         console.log(`[crawler] Bing搜索失败:`, e.message);
         return [];
       });
     }
     searchResults.push({ engine, query: q.slice(0, 40), results });
     // 每次搜索后短暂延迟，降低被限流概率
-    await new Promise((r) => setTimeout(r, 400));
+    await new Promise((r) => setTimeout(r, 500));
   }
   for (const { results } of searchResults) {
     for (const hit of results) {

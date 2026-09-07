@@ -20,7 +20,8 @@ const HOST_BLACKLIST = [
   '163.com', 'baidu.com', 'qq.com', 'weixin', 'csdn.net', 'zhihu.com',
   'xueqiu.com', '36kr.com', 'ithome.com', 'jiemian.com', 'caixin.com',
   'thepaper.cn', 'bjnews.com.cn', 'stcn.com', 'yicai.com', 'nbd.com.cn',
-  'ifeng.com', 'netease.com', 'sogou.com',
+  'ifeng.com', 'netease.com', 'sogou.com', 'people.com.cn',
+  'xinhuanet.com', 'chinanews.com.cn',
 ];
 
 /** 政府域名后缀（白名单）：.gov.cn 及其子域 */
@@ -28,12 +29,13 @@ const isGovHost = (host) => /(^|\.)gov\.cn$/.test(host) || /(^|\.)mohrss\.gov\.c
 
 /** 扩展的可信域名模式 */
 const TRUSTED_HOST_PATTERNS = [
-  /\.gov\.(com|cn|hk|mo)$/,      // 所有.gov顶级域
+  /\.gov\.(com|cn|hk|mo|au|uk|sg|in)$/,      // 所有.gov顶级域
   /\bmohrss\.gov\.cn\b/i,       // 人社部
   /\bgov\.cn\b/i,               // 中央政府
   /\b(renshe|rsj|ssh)\.cn\b/i,  // 人社相关
   /\bgjj\b/i,                    // 公积金
   /\bzfb\b/i,                    // 政府网站缩写
+  /\.gov\./i,                    // 任何政府子域
 ];
 
 function getHost(url) {
