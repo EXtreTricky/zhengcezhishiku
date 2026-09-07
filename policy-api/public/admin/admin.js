@@ -149,13 +149,13 @@ async function loadMatrix() {
   }
 }
 
-async function startRun() {
+async function startRun(opts = {}) {
   if (S.runBusy || !needAuth()) return;
   const limitSel = $('#run-limit');
   const region = $('#run-region').value;
   const category = $('#run-category').value;
   const body = {};
-  if (limitSel.value === '99999') body.all = true;
+  if (opts.all || limitSel.value === '99999') body.all = true;
   else body.limit = Number(limitSel.value);
   if (region) body.region = region;
   if (category) body.category = category;
@@ -630,6 +630,10 @@ async function ignoreItem() {
 /* ── 初始化 ───────────────────────────────── */
 document.addEventListener('DOMContentLoaded', () => {
   $('#btn-run').addEventListener('click', startRun);
+  $('#btn-run-all').addEventListener('click', () => {
+    if (S.runBusy) return;
+    startRun({ all: true });
+  });
   $('#btn-confirm').addEventListener('click', confirmWrite);
   $('#btn-ignore').addEventListener('click', ignoreItem);
   // 分组 tab
