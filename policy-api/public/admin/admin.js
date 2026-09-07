@@ -138,6 +138,13 @@ async function loadMatrix() {
     if (m.running && m.running.length) {
       $('#run-state').textContent = '运行中…';
       $('#btn-run').disabled = true;
+      // 显示停止按钮，绑定到当前运行的任务
+      const runningId = m.running[0];
+      $('#btn-stop').classList.remove('hidden');
+      $('#btn-stop').dataset.runId = runningId;
+      $('#btn-stop').title = `停止任务 ${runningId.slice(-8)}`;
+    } else {
+      $('#btn-stop').classList.add('hidden');
     }
     // 填充定向下拉（首次）
     if ($('#run-region').options.length === 1) {
@@ -190,6 +197,7 @@ function pollRun(runId) {
         clearInterval(timer);
         S.runBusy = false;
         $('#btn-run').disabled = false;
+        $('#btn-stop').classList.add('hidden');
         const res = r.result || {};
         if (res.ok) {
           $('#run-state').textContent = `✓ 完成：命中 ${res.hits ?? 0}，新入池 ${res.added ?? 0}，失败 ${res.failed ?? 0}，剩 ${res.remaining ?? '?'}`;
@@ -633,6 +641,23 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#btn-run-all').addEventListener('click', () => {
     if (S.runBusy) return;
     startRun({ all: true });
+  });
+  $('#btn-stop').addEventListener('click', async () => {
+    const runId = $('#btn-stop').dataset.runId;
+    if (!runId || S.runBusy === false) return;
+    try {
+      await api('/api/crawl/matrix-run/' + runId + '/kill', { method: 'POST' });
+      $('#run-state').textContent = '✓ 已停止';
+      $('#btn-stop').classList.add('hidden');
+      S.runBusy = false;
+      $('#btn-run').disabled = false;
+      await loadMatrix();
+    } catch (e) {
+      $('#run-state').textContent = '停止失败：' + e.message;
+      $('#btn-stop').classList.add('hidden');
+      S.runBusy = false;
+      $('#btn-run').disabled = false;
+    }
   });
   $('#btn-confirm').addEventListener('click', confirmWrite);
   $('#btn-ignore').addEventListener('click', ignoreItem);

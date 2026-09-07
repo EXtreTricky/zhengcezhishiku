@@ -148,6 +148,7 @@ function spawnMatrixRun({ limit = 15, region = '', category = '', all = false } 
       if (stderr) console.error(`[matrix-run ${runId}] stderr: ${String(stderr).slice(0, 500)}`);
     },
   );
+  entry.child = child;
   child.stdout.on('data', push);
   child.stderr.on('data', push);
   _matrixRuns.set(runId, entry);
@@ -477,6 +478,24 @@ function registerCrawlRoutes(app, ctx) {
       startedAt: run.startedAt,
       endedAt: run.endedAt,
     });
+  });
+
+  // POST /api/crawl/matrix-run/:id/kill → 停止正在运行的巡检子进程
+  app.post('/api/crawl/matrix-run/:id/kill', requireUser, (req, res) => {
+    const run = _matrixRuns.get(req.params.id);
+    if (!run) return res.status(404).json({ statusCode: 404, message: '巡检任务不存在或已结束', error: 'Not Found' });
+    if (run.state !== 'running') {
+      return res.status(400).json({ statusCode: 400, message: `任务已结束（${run.state}），无法停止`, error: 'Bad Request' });
+    }
+    if (!run.child || !run.child.kill) {
+      return res.status(500).json({ statusCode: 500, message: '子进程引用丢失，无法停止', error: 'Internal Error' });
+    }
+    run.child.kill('SIGTERM');
+    run.state = 'killed';
+    run.endedAt = db.nowIso();
+    run.result = { ok: false, error: '用户手动终止' };
+    console.log(`[matrix-run ${run.id}] 用户手动终止`);
+    res.json({ success: true, message: '巡检已停止' });
   });
 
   // POST /api/crawl/table-preview {recordId} → 目标表「整行预览」：每列当前将写入值 +
