@@ -365,6 +365,7 @@ function registerCrawlRoutes(app, ctx) {
           if (quality === 'suspect') stats.suspect += 1;
           const region = c.region || '';
           const officialUrl = c.url || (/^https?:\/\//.test(c.documentNumber || '') ? c.documentNumber : '');
+          const category = c.category || classifyCategory(`${c.title}${c.content}`) || '';
           return {
             province: region,
             city: '',
@@ -373,7 +374,8 @@ function registerCrawlRoutes(app, ctx) {
             publishDate: c.releaseDate || '',
             officialUrl,
             source: c.org || c.source || 'manual',
-            policyDomain: c.category || classifyCategory(`${c.title}${c.content}`) || '',
+            category,
+            policyDomain: category,
             comparisonResult: st,
             bitableRecordId: c.id,
             matchedTitle: c.similarPolicy ? c.similarPolicy.title || '' : '',

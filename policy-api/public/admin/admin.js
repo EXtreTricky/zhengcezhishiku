@@ -342,7 +342,7 @@ function visibleItems() {
   else items = items.filter((i) => i.comparisonResult !== 'exists' && !isSuspect(i));
   // 分类过滤
   if (S.catFilter !== 'all') {
-    items = items.filter((i) => (i.topicCategory || i.category) === S.catFilter);
+    items = items.filter((i) => (i.topicCategory || i.category || i.policyDomain) === S.catFilter);
   }
   // 排序
   if (S.sort === 'date') {
