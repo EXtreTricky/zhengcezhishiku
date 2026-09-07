@@ -104,6 +104,16 @@ const CATEGORY_NEGATIVE = {
   ],
 };
 
+/** 模板 / 占位符标题：抓取侧可能生成「最低工资标准 2026-XX-XX 起调整」这类合成标题，
+ *  其 url 往往不可访问，非真实政策。命中即硬丢弃。 */
+const TEMPLATE_TITLE_PATTERNS = [
+  /20\d{2}[-/.年]XX/,          // 2026-XX / 2026年XX（年份后跟占位符）
+  /(^|\D)XX[-/.月]XX(\D|$)/,   // XX月XX / XX-XX（日期槽位未填）
+  /\{[^}]+\}/,                 // {date} / {日期} 等模板槽位
+  /占位符/,                    // 字面「占位符」
+  /\bTODO\b|\bTBD\b/i,
+];
+
 /** 标题被截断（抓取时截断） */
 const TRUNCATED = /(\.\.\.|…|更多>>|详情>>)$/;
 
@@ -165,6 +175,13 @@ function judge(item) {
   }
   if (looksLikeStation(bare)) {
     return { level: 'drop', reasons: ['标题是站点名/导航页，非政策条目'], title };
+  }
+
+  // ── L0-c2 模板 / 占位符标题：疑似合成假数据 ──
+  for (const re of TEMPLATE_TITLE_PATTERNS) {
+    if (re.test(bare)) {
+      return { level: 'drop', reasons: ['标题含未填充占位符，疑似模板合成数据'], title };
+    }
   }
 
   // ── L1-a 事务性噪音（评选/采购/公示/信息披露）──
@@ -234,4 +251,5 @@ module.exports = {
   AFFAIR_NOISE_WORDS,
   POLICY_FORM_WORDS,
   CATEGORY_NEGATIVE,
+  TEMPLATE_TITLE_PATTERNS,
 };
