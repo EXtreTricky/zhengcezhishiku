@@ -17,11 +17,43 @@
 
 const db = require('../../src/db');
 const { judge } = require('./quality-gate');
+const { spawn } = require('child_process');
+const path = require('path');
 
 // 配置统一走 getConfig() 动态读取 process.env，支持运行时通过 /api/cron/schedule 热更新
 
 let timer = null;
 let lastRun = null;
+
+/**
+ * 启动一次本地矩阵滚动巡检（实际抓取政府站新政策）。
+ * 复用 scripts/sweep-crawl.js：队列耗尽自动重置、URL 级去重只加新政策。
+ * @param {{all?:boolean, limit?:number}} opts
+ */
+function runLocalSweep(opts = {}) {
+  return new Promise((resolve) => {
+    const args = ['scripts/sweep-crawl.js', 'run'];
+    if (opts.all) args.push('--all');
+    else if (opts.limit) args.push('--limit', String(opts.limit));
+    const child = spawn(process.execPath, args, {
+      cwd: path.join(__dirname, '..', '..'),
+      timeout: 0,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    let out = '';
+    child.stdout.on('data', (d) => (out += d));
+    child.stderr.on('data', (d) => (out += d));
+    child.on('error', (e) => resolve({ code: -1, error: e.message, result: null }));
+    child.on('close', (code) => {
+      const m = out.lastIndexOf('__RESULT__');
+      let result = null;
+      if (m !== -1) {
+        try { result = JSON.parse(out.slice(m + '__RESULT__'.length)); } catch (_) {}
+      }
+      resolve({ code, result, raw: out.slice(-1500) });
+    });
+  });
+}
 
 function getLogger() {
   return {
@@ -245,44 +277,82 @@ function getConfig() {
 
 /** 手动触发一次爬取（不等待定时） */
 async function runNow() {
-  if (!_bitableClient || !_policySources) {
-    return { success: false, error: '调度器未初始化' };
+  if (_bitableClient && _policySources) {
+    return runCrawl(_bitableClient, _policySources);
   }
-  return runCrawl(_bitableClient, _policySources);
+  // 无飞书汇总配置时，fallback 到本地矩阵滚动巡检
+  return runLocalNow();
+}
+
+/**
+ * 手动触发一次本地矩阵滚动巡检（无飞书汇总表时作为默认方案）。
+ * 复用 scripts/sweep-crawl.js：队列耗尽自动重置、URL 级去重只加新政策。
+ */
+async function runLocalNow() {
+  const log = getLogger();
+  log.info('[cron] 运行本地矩阵滚动巡检…');
+  const r = await runLocalSweep({ all: false, limit: 15 });
+  const res = { ok: true, source: 'local_sweep' };
+  if (r.result) {
+    res.hits = r.result.hits;
+    res.added = r.result.added;
+    res.failed = r.result.failed;
+    res.remaining = r.result.remaining;
+    res.done = r.result.done;
+    res.message = r.result.message;
+  } else {
+    res.error = r.error || '子进程无结果';
+    res.raw = r.raw;
+  }
+  lastRun = new Date().toISOString();
+  return res;
 }
 
 let _bitableClient = null;
 let _policySources = null;
 
 /**
- * 启动定时调度
+ * 启动定时调度。
+ * 优先使用飞书汇总配置（bitableClient + policySources）。
+ * 无飞书汇总时，退化为本地矩阵滚动巡检：每隔 N 小时跑一次（默认 6h）。
  */
 function startScheduler(bitableClient, policySources) {
   _bitableClient = bitableClient;
   _policySources = policySources;
 
   const cfg = getConfig();
-  if (!cfg.enabled) {
-    console.log('[cron] 定时爬取未启用（设置 CRON_ENABLED=true 或调用 /api/cron/schedule 开启）');
+  const hasFeishu = _bitableClient && _policySources;
+
+  const log = getLogger();
+  if (hasFeishu) {
+    if (!cfg.enabled) {
+      console.log('[cron] 定时爬取未启用（设置 CRON_ENABLED=true 或调用 /api/cron/schedule 开启）');
+      return;
+    }
+    const delay = msUntilNext();
+    const nextTime = new Date(Date.now() + delay);
+    log.info(`定时爬取已启用（飞书汇总模式），下次执行：${nextTime.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`);
+
+    timer = setTimeout(async function tick() {
+      await runCrawl(bitableClient, policySources);
+      if (cfg.intervalHours > 0) {
+        timer = setTimeout(tick, cfg.intervalHours * 3600 * 1000);
+      } else {
+        timer = setTimeout(tick, msUntilNext());
+      }
+    }, delay);
     return;
   }
 
-  const log = getLogger();
-  const delay = msUntilNext();
-  const nextTime = new Date(Date.now() + delay);
+  // 无飞书汇总 → 本地 sweep 循环（每 N 小时跑一次，默认 6h）
+  const intervalHours = cfg.intervalHours > 0 ? cfg.intervalHours : 6;
+  const log2 = getLogger();
+  log2.info(`定时爬取已启用（本地 sweep 模式，飞书汇总表未配置），每 ${intervalHours}h 一轮`);
 
-  log.info(`定时爬取已启用，下次执行：${nextTime.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`);
-
-  // 首次定时
-  timer = setTimeout(async function tick() {
-    await runCrawl(bitableClient, policySources);
-
-    if (cfg.intervalHours > 0) {
-      timer = setTimeout(tick, cfg.intervalHours * 3600 * 1000);
-    } else {
-      timer = setTimeout(tick, msUntilNext());
-    }
-  }, delay);
+  timer = setTimeout(async function tickLocal() {
+    try { await runLocalNow(); } catch (_) {}
+    timer = setTimeout(tickLocal, intervalHours * 3600 * 1000);
+  }, intervalHours * 3600 * 1000); // 服务启动即启动，不卡首小时
 }
 
 function stopScheduler() {
@@ -303,4 +373,4 @@ function getStatus() {
   };
 }
 
-module.exports = { startScheduler, stopScheduler, runCrawl, runNow, updateSchedule, getStatus };
+module.exports = { startScheduler, stopScheduler, runCrawl, runNow, runLocalNow, updateSchedule, getStatus };

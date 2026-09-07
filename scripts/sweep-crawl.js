@@ -103,7 +103,14 @@ function resetTasks() {
 }
 
 async function runBatch({ limit, region, category, all }) {
-  const tasks = pickTasks(all ? 99999 : limit, region, category);
+  let tasks = pickTasks(all ? 99999 : limit, region, category);
+  // 队列耗尽（上一轮全部标记 done）→ 自动重置开始新一轮巡检，捕捉期间新发布政策。
+  // 定向补充（指定 region/category）不自动重置，避免误清空其它格子进度。
+  if (!tasks.length && !region && !category) {
+    console.log('任务队列已耗尽，自动重置并开始新一轮滚动巡检…');
+    resetTasks();
+    tasks = pickTasks(all ? 99999 : limit, region, category);
+  }
   if (!tasks.length) {
     process.stdout.write('\n__RESULT__' + JSON.stringify({ ok: true, done: 0, hits: 0, added: 0, remaining: ensureTasks().filter((t) => t.status !== 'done').length, message: all ? '矩阵已全部巡检完毕' : '当前无待跑任务' }));
     return;

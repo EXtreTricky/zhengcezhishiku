@@ -365,10 +365,20 @@ app.put('/api/cron/schedule', requireUser, (req, res) => {
   res.json(result);
 });
 
-// POST /api/cron/run → 手动触发一次爬取
+// POST /api/cron/run → 手动触发一次爬取（飞书汇总优先，fallback 本地 sweep）
 app.post('/api/cron/run', requireUser, async (req, res, next) => {
   try {
     const result = await cron.runNow();
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/cron/local-run → 强制触发一次本地矩阵滚动巡检（跳过飞书汇总）
+app.post('/api/cron/local-run', requireUser, async (req, res, next) => {
+  try {
+    const result = await cron.runLocalNow();
     res.json(result);
   } catch (err) {
     next(err);
