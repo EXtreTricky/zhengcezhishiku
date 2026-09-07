@@ -73,11 +73,20 @@ async function boot() {
   $('#btnTheme').addEventListener('click', toggleTheme);
   try {
     S.me = await api('/api/me');
-    $('#who').textContent = S.me.name || S.me.sub || '';
   } catch (e) {
     S.me = null;
-    showLoginBanner();
   }
+  // MOCK 模式且未登录 → 自动走 /auth/login 拿模拟 cookie（免手动点登录）
+  if (!S.me || !S.me.authenticated) {
+    if (S.me && S.me.mock) {
+      location.assign('/auth/login');
+      return;
+    }
+    S.me = null;
+    showLoginBanner();
+    return;
+  }
+  $('#who').textContent = S.me.name || S.me.sub || '';
   try {
     await Promise.all([loadMatrix(), loadList()]);
   } catch (e) {

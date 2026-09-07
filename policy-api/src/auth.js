@@ -277,6 +277,10 @@ function attachAuth(app) {
   // ⑦ 登录态探测（前端用它判断是否需要跳登录；浏览只读接口不要求登录）
   app.get('/api/me', (req, res) => {
     if (!req.user) {
+      // MOCK 模式：告知前端可自动登录（/auth/login 会绕过飞书写入模拟 cookie）
+      if (process.env.MOCK_LOGIN === 'true') {
+        return res.json({ authenticated: false, mock: true, loginUrl: '/auth/login' });
+      }
       return res.status(401).json({ authenticated: false, loginUrl: '/auth/login' });
     }
     const { user_access_token, refresh_token, exp, iat, ...safe } = req.user;
