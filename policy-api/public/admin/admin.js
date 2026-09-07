@@ -328,7 +328,7 @@ const isSuspect = (i) => i.quality === 'suspect';
 function getCategories() {
   const cats = new Set();
   S.items.forEach((i) => {
-    const c = i.topicCategory || i.category;
+    const c = i.category;
     if (c && c !== '薪酬月刊') cats.add(c);
   });
   return Array.from(cats).sort();
