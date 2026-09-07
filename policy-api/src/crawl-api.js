@@ -322,7 +322,16 @@ function buildWriteFields(targetFields, item) {
 function registerCrawlRoutes(app, ctx) {
   const { store, bitable } = ctx;
 
-  const crawlList = () => db.getDb().crawlQueue;
+  // 读取兜底：任何入池条目缺 id 自动补（枚举/爬虫个别路径漏设时，预览/入库/忽略仍可定位）
+  const crawlList = () => {
+    const q = db.getDb().crawlQueue;
+    let dirty = false;
+    for (const c of q) {
+      if (!c.id) { c.id = db.uid('crawl'); dirty = true; }
+    }
+    if (dirty) db.save();
+    return q;
+  };
 
   // GET /api/crawl/crawled-pending → 待确认清单 + stats{new,exists,needs_update}
   // 响应形状 1:1 对齐原版 shared/api.interface.ts 的 ICrawlResult：
