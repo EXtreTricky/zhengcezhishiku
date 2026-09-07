@@ -22,9 +22,6 @@ const S = {
   runBusy: false,
   confirmBusy: false,
   filter: 'todo',       // todo(new+needs_update) / exists / all
-  sort: 'date',         // date | relevance
-  sortDir: 'desc',      // desc | asc
-  catFilter: 'all',     // all | 具体分类
   checked: new Set(),   // 勾选的 bitableRecordId
 };
 
@@ -141,13 +138,6 @@ async function loadMatrix() {
     if (m.running && m.running.length) {
       $('#run-state').textContent = '运行中…';
       $('#btn-run').disabled = true;
-      // 显示停止按钮，绑定到当前运行的任务
-      const runningId = m.running[0];
-      $('#btn-stop').classList.remove('hidden');
-      $('#btn-stop').dataset.runId = runningId;
-      $('#btn-stop').title = `停止任务 ${runningId.slice(-8)}`;
-    } else {
-      $('#btn-stop').classList.add('hidden');
     }
     // 填充定向下拉（首次）
     if ($('#run-region').options.length === 1) {
@@ -200,7 +190,6 @@ function pollRun(runId) {
         clearInterval(timer);
         S.runBusy = false;
         $('#btn-run').disabled = false;
-        $('#btn-stop').classList.add('hidden');
         const res = r.result || {};
         if (res.ok) {
           $('#run-state').textContent = `✓ 完成：命中 ${res.hits ?? 0}，新入池 ${res.added ?? 0}，失败 ${res.failed ?? 0}，剩 ${res.remaining ?? '?'}`;
@@ -244,33 +233,14 @@ function renderStats(st) {
 function renderList() {
   const box = $('#list');
   const empty = $('#list-empty');
-  const ctrlbar = $('#ctrlbar');
   if (!S.items.length) {
     box.innerHTML = '';
     empty.classList.remove('hidden');
-    ctrlbar.classList.add('hidden');
     renderTabs();
     $('#batchbar').classList.add('hidden');
     return;
   }
   empty.classList.add('hidden');
-  ctrlbar.classList.remove('hidden');
-  // 更新排序按钮状态
-  $$('.ctrlbtns .ctrlbtn').forEach((b) => {
-    b.classList.toggle('on', b.dataset.sort === S.sort);
-  });
-  const dirBtn = $('#btnSortDir');
-  if (dirBtn) dirBtn.textContent = S.sortDir === 'desc' ? '↓' : '↑';
-  // 更新分类选择器（如果为空则填充）
-  const catSel = $('#catFilter');
-  if (catSel && !catSel.options.length) {
-    const cats = getCategories();
-    cats.forEach((c) => {
-      const opt = new Option(c, c);
-      catSel.add(opt);
-    });
-  }
-  if (catSel) catSel.value = S.catFilter;
   const vis = visibleItems();
   // 清理已不存在的勾选
   S.checked = new Set([...S.checked].filter((id) => vis.some((v) => v.bitableRecordId === id)));
@@ -325,34 +295,12 @@ function renderList() {
 
 /* ── 分组过滤 + 批量操作 ─────────────────── */
 const isSuspect = (i) => i.quality === 'suspect';
-function getCategories() {
-  const cats = new Set();
-  S.items.forEach((i) => {
-    const c = i.topicCategory || i.category;
-    if (c && c !== '薪酬月刊') cats.add(c);
-  });
-  return Array.from(cats).sort();
-}
 function visibleItems() {
-  let items = S.items;
-  // 分组过滤
   const f = S.filter;
-  if (f === 'all') {} else if (f === 'suspect') items = items.filter((i) => isSuspect(i));
-  else if (f === 'exists') items = items.filter((i) => i.comparisonResult === 'exists');
-  else items = items.filter((i) => i.comparisonResult !== 'exists' && !isSuspect(i));
-  // 分类过滤
-  if (S.catFilter !== 'all') {
-    items = items.filter((i) => (i.topicCategory || i.category) === S.catFilter);
-  }
-  // 排序
-  if (S.sort === 'date') {
-    items = [...items].sort((a, b) => {
-      const da = a.publishDate ? new Date(a.publishDate).getTime() : 0;
-      const db = b.publishDate ? new Date(b.publishDate).getTime() : 0;
-      return S.sortDir === 'desc' ? db - da : da - db;
-    });
-  }
-  return items;
+  if (f === 'all') return S.items;
+  if (f === 'suspect') return S.items.filter((i) => isSuspect(i));
+  if (f === 'exists') return S.items.filter((i) => i.comparisonResult === 'exists');
+  return S.items.filter((i) => i.comparisonResult !== 'exists' && !isSuspect(i)); // todo: new + needs_update（排除存疑）
 }
 function countBy(f) {
   if (f === 'all') return S.items.length;
@@ -686,54 +634,6 @@ document.addEventListener('DOMContentLoaded', () => {
     if (S.runBusy) return;
     startRun({ all: true });
   });
-  $('#btn-stop').addEventListener('click', async () => {
-    const runId = $('#btn-stop').dataset.runId;
-    if (!runId || S.runBusy === false) return;
-    try {
-      await api('/api/crawl/matrix-run/' + runId + '/kill', { method: 'POST' });
-      $('#run-state').textContent = '✓ 已停止';
-      $('#btn-stop').classList.add('hidden');
-      S.runBusy = false;
-      $('#btn-run').disabled = false;
-      await loadMatrix();
-    } catch (e) {
-      $('#run-state').textContent = '停止失败：' + e.message;
-      $('#btn-stop').classList.add('hidden');
-      S.runBusy = false;
-      $('#btn-run').disabled = false;
-    }
-  });
-  // AI 智能发现按钮
-  $('#btn-ai-expand').addEventListener('click', async () => {
-    if (S.runBusy || !needAuth()) return;
-    const region = $('#run-region').value || '全国';
-    const category = $('#run-category').value || '最低工资';
-    S.runBusy = true;
-    $('#btn-ai-expand').disabled = true;
-    $('#run-state').textContent = 'AI 生成变体词并补搜中…';
-    const logEl = $('#run-log');
-    logEl.classList.remove('hidden');
-    logEl.textContent = '';
-    try {
-      const r = await api('/api/crawl/ai-expand', {
-        method: 'POST',
-        body: { keyword: category, region, count: 5 },
-      });
-      const terms = (r.terms || []).join('\n');
-      logEl.textContent =
-        `基础词「${category}」命中 ${r.baseHits} 条\n` +
-        `AI 生成 ${r.expandedTerms} 个变体词\n` +
-        `变体词额外命中 ${r.extraHits} 条\n` +
-        `唯一条目 ${r.totalUnique} 条，新入池 ${r.addedToQueue} 条\n\n` +
-        (terms ? `变体词列表：\n${terms}` : '（未生成变体词或基础词已有命中）');
-      $('#run-state').textContent = '✓ AI 智能发现完成';
-      await loadMatrix();
-    } catch (e) {
-      $('#run-state').textContent = 'AI 发现失败：' + e.message;
-    }
-    S.runBusy = false;
-    $('#btn-ai-expand').disabled = false;
-  });
   $('#btn-confirm').addEventListener('click', confirmWrite);
   $('#btn-ignore').addEventListener('click', ignoreItem);
   // 分组 tab
@@ -742,26 +642,6 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!tab) return;
     S.filter = tab.dataset.f;
     $$('#tabbar .tab').forEach((t) => t.classList.toggle('on', t === tab));
-    S.checked = new Set();
-    renderList();
-  });
-  // 排序按钮
-  $('.ctrlbtns').addEventListener('click', (ev) => {
-    const btn = ev.target.closest('.ctrlbtn');
-    if (!btn) return;
-    if (btn.dataset.sort) {
-      S.sort = btn.dataset.sort;
-      $$('.ctrlbtns .ctrlbtn').forEach((b) => b.classList.toggle('on', b.dataset.sort === S.sort));
-    }
-    if (btn.id === 'btnSortDir') {
-      S.sortDir = S.sortDir === 'desc' ? 'asc' : 'desc';
-      btn.textContent = S.sortDir === 'desc' ? '↓' : '↑';
-    }
-    renderList();
-  });
-  // 分类选择
-  $('#catFilter').addEventListener('change', (ev) => {
-    S.catFilter = ev.target.value;
     S.checked = new Set();
     renderList();
   });

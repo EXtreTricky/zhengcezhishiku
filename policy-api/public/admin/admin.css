@@ -254,3 +254,15 @@ html[data-theme="dark"] .prog{background:rgba(255,255,255,.07)}
 .alist .a-item .ai-body .ai-top{display:flex;align-items:center;gap:8px}
 .alist .a-item .ai-body .ai-top .ai-title{flex:1;min-width:0}
 html[data-theme="dark"] .btn-trust{color:#fff}
+
+
+/* ── 排序和分类控制条 ── */
+.ctrlbar{display:flex;align-items:center;gap:16px;padding:8px 12px;background:var(--surface-2);border-bottom:1px solid var(--hair);flex-wrap:wrap}
+.ctrlgrp{display:flex;align-items:center;gap:6px}
+.ctrllbl{font-size:12px;color:var(--ink-3);font-weight:500}
+.ctrlbtns{display:flex;align-items:center;gap:2px}
+.ctrlbtn{display:inline-flex;align-items:center;justify-content:center;padding:4px 10px;font-size:12px;color:var(--ink-3);border:1px solid var(--hair);border-radius:6px;cursor:pointer;transition:.15s;background:var(--surface);min-width:32px}
+.ctrlbtn:hover{color:var(--brand);border-color:var(--brand)}
+.ctrlbtn.on{color:var(--brand);border-color:var(--brand);background:var(--brand-soft)}
+.ctrlsel{padding:4px 8px;font-size:12px;border:1px solid var(--hair);border-radius:6px;background:var(--surface);color:var(--ink-2);cursor:pointer}
+.ctrlsel:focus{border-color:var(--brand);outline:none}

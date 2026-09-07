@@ -16,15 +16,25 @@
 // ─── 1. 域名规则 ─────────────────────────────────────────────
 /** 明确商业 / 自媒体 / 门户转载源：直接丢弃 */
 const HOST_BLACKLIST = [
-  'toutiao.com', 'jwview.com', 'china.com', 'sohu.com', 'sina.com',
+  'toutiao.com', 'jwview.com', 'china.com', 'sina.com',
   '163.com', 'baidu.com', 'qq.com', 'weixin', 'csdn.net', 'zhihu.com',
   'xueqiu.com', '36kr.com', 'ithome.com', 'jiemian.com', 'caixin.com',
   'thepaper.cn', 'bjnews.com.cn', 'stcn.com', 'yicai.com', 'nbd.com.cn',
-  'ifeng.com',
+  'ifeng.com', 'netease.com', 'sogou.com',
 ];
 
 /** 政府域名后缀（白名单）：.gov.cn 及其子域 */
 const isGovHost = (host) => /(^|\.)gov\.cn$/.test(host) || /(^|\.)mohrss\.gov\.cn$/.test(host) || /\.gov\./.test(host);
+
+/** 扩展的可信域名模式 */
+const TRUSTED_HOST_PATTERNS = [
+  /\.gov\.(com|cn|hk|mo)$/,      // 所有.gov顶级域
+  /\bmohrss\.gov\.cn\b/i,       // 人社部
+  /\bgov\.cn\b/i,               // 中央政府
+  /\b(renshe|rsj|ssh)\.cn\b/i,  // 人社相关
+  /\bgjj\b/i,                    // 公积金
+  /\bzfb\b/i,                    // 政府网站缩写
+];
 
 function getHost(url) {
   try {
@@ -165,7 +175,9 @@ function judge(item) {
     return { level: 'drop', reasons: [`非政府来源（${host}）`], title };
   }
   // 非政府域名且不在白名单 → 存疑（不完全否定，可能是事业单位）
-  if (host && !isGovHost(host)) reasons.push(`来源非 .gov.cn（${host}）`);
+  if (host && !isGovHost(host) && !TRUSTED_HOST_PATTERNS.some(p => p.test(host))) {
+    reasons.push(`来源非可信政府域名（${host}）`);
+  }
 
   // ── L0-c 站名 / 导航页：直接丢 ──
   for (const re of STATION_PATTERNS) {

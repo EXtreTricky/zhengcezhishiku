@@ -157,6 +157,23 @@
               <button class="tab" data-f="exists" role="tab">库中已有 <b id="tbExists">0</b></button>
               <button class="tab" data-f="all" role="tab">全部 <b id="tbAll">0</b></button>
             </div>
+            <!-- 排序和分类控制条 -->
+            <div class="ctrlbar hidden" id="ctrlbar">
+              <div class="ctrlgrp">
+                <label class="ctrllbl">排序</label>
+                <div class="ctrlbtns">
+                  <button class="ctrlbtn on" data-sort="date">发布日期</button>
+                  <button class="ctrlbtn" data-sort="relevance">相关度</button>
+                  <button class="ctrlbtn" id="btnSortDir" title="切换升序/降序">↓</button>
+                </div>
+              </div>
+              <div class="ctrlgrp">
+                <label class="ctrllbl">分类</label>
+                <select id="catFilter" class="ctrlsel">
+                  <option value="all">全部分类</option>
+                </select>
+              </div>
+            </div>
             <!-- 批量操作条：选中后一键入库 / 忽略 -->
             <div id="batchbar" class="batchbar hidden">
               <label class="chk-all" title="勾选当前分组全部"><input type="checkbox" id="ckAll" /><span>全选本组</span></label>
