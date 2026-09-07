@@ -284,12 +284,20 @@ async function discoverBySearch({ keyword, region }) {
   });
   for (const hit of libResult) found.set(hit.url, hit);
 
-  const searchResults = await Promise.allSettled(
-    searchPlan.map(({ engine, q }) => (engine === 'baidu' ? baiduSearch(q, 10) : bingSearch(q, 8))),
-  );
-  for (const r of searchResults) {
-    if (r.status !== 'fulfilled') continue;
-    for (const hit of r.value) {
+  // 顺序执行搜索（避免并发触发搜索引擎限流，导致返回无关结果）
+  const searchResults = [];
+  for (const { engine, q } of searchPlan) {
+    const fn = engine === 'baidu' ? baiduSearch : bingSearch;
+    const results = await fn(q, engine === 'baidu' ? 10 : 8).catch((e) => {
+      console.log(`[crawler] ${engine}搜索失败:`, e.message);
+      return [];
+    });
+    searchResults.push({ engine, results });
+    // 每次搜索后短暂延迟，降低被限流概率
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  for (const { results } of searchResults) {
+    for (const hit of results) {
       if (!found.has(hit.url)) found.set(hit.url, hit);
     }
   }
