@@ -1,0 +1,6 @@
+#!/bin/bash
+# 腾讯云 SCF Web 函数启动脚本
+# 上传到函数根目录，给执行权限：chmod +x scf_bootstrap
+export PORT=9000
+export NODE_ENV=production
+/var/lang/node18/bin/node deploy/sls.js

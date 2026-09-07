@@ -1,0 +1,34 @@
+# ── 依赖 ──
+node_modules/
+.serverless/
+
+# ── 环境变量 / 密钥 ──
+.env
+.env.*
+!.env.example
+
+# ── 运行时数据（含爬取结果与本地状态，clone 后 db.js 会自动建空库）──
+data/db.json
+data/db.json.bak-*
+data/db.backup-*.json
+data/*.tmp
+
+# ── 登录态 / Cookie ──
+cookiejar.txt
+*.cookie
+
+# ── 日志 ──
+*.log
+
+# ── 本地缓存与 WorkBuddy 工作区 ──
+.workbuddy/
+.policy-cache/
+**/_enum-cache/
+
+# ── 临时调试脚本（以下划线开头，常含本地密钥，不入库）──
+scripts/_*.js
+policy-api/scripts/_*.js
+
+# ── 系统文件 ──
+.DS_Store
+Thumbs.db

@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>政策知识库 · 采集审批工作台</title>
+<script>
+(function () {
+  try {
+    var t = localStorage.getItem('pk-theme');
+    if (t === 'dark') document.documentElement.dataset.theme = 'dark';
+    else if (t === 'light') document.documentElement.dataset.theme = 'light';
+    else document.documentElement.dataset.theme = (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+  } catch (e) { document.documentElement.dataset.theme = 'light'; }
+})();
+</script>
+<link rel="stylesheet" href="/admin/admin.css" />
+</head>
+<body>
+
+<svg style="display:none" aria-hidden="true">
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9.5 21v-6h5v6"/></symbol>
+  <symbol id="i-clip" viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="17" rx="2.5"/><path d="M9 4.5V3h6v1.5"/><path d="M9 11h6M9 15h4"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M19.1 4.9l-1.8 1.8M6.7 17.3l-1.8 1.8"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 13.5A8 8 0 0 1 10.5 4 8 8 0 1 0 20 13.5Z"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.5v15l13-7.5z"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+  <symbol id="i-ext" viewBox="0 0 24 24"><path d="M13 5h6v6"/><path d="M19 5 11 13"/><path d="M19 14v5a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 5 19V8a1.5 1.5 0 0 1 1.5-1.5H11"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24"><path d="M13 2 4.5 13.5H11L10 22l8.5-11.5H12L13 2Z"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></symbol>
+  <symbol id="i-scale" viewBox="0 0 24 24"><path d="M12 3v18M5 21h14"/><path d="M6 8h12l-1.5-4h-9z"/><path d="M6 8c-2 1-2.5 3-1.5 4M18 8c2 1 2.5 3 1.5 4"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M18.4 5.6l-2.8 2.8M8.4 15.6l-2.8 2.8"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="m4.5 12.5 5 5 10-11"/></symbol>
+</svg>
+
+<div id="login-banner" class="loginbar hidden">
+  <svg width="14" height="14"><use href="#i-x"/></svg>
+  <span>未登录 — 预览与入库需要登录态</span>
+  <a class="btn btn-sm btn-primary" href="/auth/login">去登录</a>
+</div>
+
+<div class="app">
+  <!-- 左侧导航 rail -->
+  <nav class="rail" aria-label="主导航">
+    <a class="rail-logo" href="/" title="政策知识库"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 4h10l4 4v12H5z"/><path d="M15 4v4h4"/><path d="M8.5 12h7M8.5 15.5h7"/></svg></a>
+    <a class="rnav" href="/" title="数据总览"><svg><use href="#i-home"/></svg></a>
+    <a class="rnav on" href="/admin/" title="采集审批工作台">
+      <svg><use href="#i-clip"/></svg>
+      <span id="navDot" class="dot hidden">0</span>
+    </a>
+    <div class="gap"></div>
+  </nav>
+
+  <!-- 右侧舞台 -->
+  <div class="stage">
+    <header class="topbar">
+      <div class="ctx">
+        <div class="crumb">政策知识库 <b>/</b> 采集审批</div>
+        <h1>采集审批工作台</h1>
+      </div>
+      <div class="tb-right">
+        <span id="llm-badge" class="pill mode-off" title="字段提取引擎状态"><svg width="12" height="12"><use href="#i-spark"/></svg><span id="llm-txt">本地规则模式</span></span>
+        <button id="btnTheme" class="iconbtn" title="切换深浅主题">
+          <svg class="i-sun"><use href="#i-sun"/></svg>
+          <svg class="i-moon"><use href="#i-moon"/></svg>
+        </button>
+        <span class="who"><span id="who" class="who-name"></span></span>
+      </div>
+    </header>
+
+    <main class="main">
+      <div class="hero">
+        <div>
+          <h1>采集入库 · 批量审批</h1>
+          <p>自动抓取 → 新命中入池 → 一键批量入库；逐条核对仅在需要时</p>
+        </div>
+        <div class="h-right">
+          <span class="srcdot"></span><span class="srctxt">写入直连 Bitable</span>
+          <a class="btn btn-ghost" href="/" target="_blank" rel="noopener">主站浏览<svg width="14" height="14"><use href="#i-ext"/></svg></a>
+        </div>
+      </div>
+
+      <div class="alayout">
+        <!-- 左：矩阵巡检队列 + 一键巡检 -->
+        <div class="acol acol-left">
+          <section class="card">
+            <div class="ch">
+              <span class="cico"><svg><use href="#i-scale"/></svg></span>
+              <h3>矩阵巡检队列</h3>
+              <span class="chx"><span class="ptag">核心省 × 10 类</span></span>
+            </div>
+            <div class="cb">
+              <div class="cstat">
+                <div class="cs"><b id="m-total">–</b><span>总组合</span></div>
+                <div class="cs ok"><b id="m-done">–</b><span>已完成</span></div>
+                <div class="cs err"><b id="m-err">–</b><span>失败</span></div>
+                <div class="cs go"><b id="m-rest">–</b><span>待跑</span></div>
+              </div>
+              <div class="prog" title="绿=完成 · 红=失败 · 蓝=待跑">
+                <i id="pOk" class="p-ok" style="width:0%"></i><i id="pErr" class="p-err" style="width:0%"></i><i id="pGo" class="p-go" style="width:0%"></i>
+              </div>
+              <div class="kvmini"><span>待确认池</span><b id="m-pending">–</b></div>
+              <div class="kvmini"><span>待同步（写权限）</span><b id="m-outbox" class="alert">–</b></div>
+              <p id="m-err-detail" class="hint err hidden"></p>
+            </div>
+          </section>
+
+          <section class="card">
+            <div class="ch">
+              <span class="cico green"><svg><use href="#i-play"/></svg></span>
+              <h3>一键巡检</h3>
+              <span class="chx"><span id="run-state" class="hint"></span></span>
+            </div>
+            <div class="cb">
+              <div class="frow">
+                <label>批量</label>
+                <select id="run-limit">
+                  <option value="5">5 个组合</option>
+                  <option value="15" selected>15 个组合（默认）</option>
+                  <option value="30">30 个组合</option>
+                  <option value="99999">跑完全部剩余</option>
+                </select>
+              </div>
+              <div class="frow">
+                <label>定向地区</label>
+                <select id="run-region"><option value="">（不限）</option></select>
+              </div>
+              <div class="frow">
+                <label>定向类别</label>
+                <select id="run-category"><option value="">（不限）</option></select>
+              </div>
+              <button id="btn-run" class="btn btn-primary btn-block"><svg width="14" height="14"><use href="#i-play"/></svg>开始巡检一批</button>
+              <pre id="run-log" class="log hidden"></pre>
+            </div>
+          </section>
+        </div>
+
+        <!-- 中：待审批列表 -->
+        <section class="acol acol-mid">
+          <div class="card">
+            <div class="ch">
+              <span class="cico violet"><svg><use href="#i-eye"/></svg></span>
+              <h3>待审批条目</h3>
+              <span class="chx counts" id="list-stats"></span>
+            </div>
+            <!-- 分组筛选：把「新发现/需更新」与「库中已有」分开，减少噪音 -->
+            <div class="tabbar" id="tabbar" role="tablist">
+              <button class="tab on" data-f="todo" role="tab">待处理 <b id="tbTodo">0</b></button>
+              <button class="tab" data-f="suspect" role="tab" title="评选/中标/采购公示、站名页等入库无价值的存疑条目">存疑 <b id="tbSuspect">0</b></button>
+              <button class="tab" data-f="exists" role="tab">库中已有 <b id="tbExists">0</b></button>
+              <button class="tab" data-f="all" role="tab">全部 <b id="tbAll">0</b></button>
+            </div>
+            <!-- 批量操作条：选中后一键入库 / 忽略 -->
+            <div id="batchbar" class="batchbar hidden">
+              <label class="chk-all" title="勾选当前分组全部"><input type="checkbox" id="ckAll" /><span>全选本组</span></label>
+              <span class="bcount" id="ckCount">0 条已选</span>
+              <span class="grow"></span>
+              <button id="btnIgnoreSuspect" class="btn btn-ghost" title="批量移除全部存疑条目（评选/中标/采购公示等）" disabled>忽略全部存疑</button>
+              <button id="btnBatchIgnore" class="btn btn-ghost" disabled>忽略选中</button>
+              <button id="btnBatchConfirm" class="btn btn-primary" disabled>入库选中</button>
+              <button id="btnTrustTodo" class="btn btn-primary btn-trust" title="跳过逐条核对，直接写入全部「待处理」条目">直接入库全部<span id="trustN" class="trustn">–</span></button>
+            </div>
+            <div id="batchMsg" class="batchmsg hidden"></div>
+            <div id="list" class="alist"></div>
+            <div id="list-empty" class="a-empty hidden">
+              <svg><use href="#i-eye"/></svg>
+              暂无待审批条目
+              <span class="hint">点上方「开始巡检一批」采集新政策</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- 右：目标表行预览 -->
+        <section class="acol acol-right">
+          <div class="card">
+            <div id="preview-empty" class="a-empty">
+              <svg><use href="#i-grid"/></svg>
+              从左侧选择一条待审批条目
+              <span class="hint">此处按目标多维表格列展示「建议值 / 依据 / 当前值」，可逐格修改后确认入库</span>
+            </div>
+            <div id="preview" class="hidden">
+              <div class="pv-head">
+                <div class="pv-title">
+                  <b>目标表</b>
+                  <div class="pv-table">
+                    <span id="pv-cat" class="chip on">–</span>
+                    <span class="pv-tablename" id="pv-table">–</span>
+                  </div>
+                  <div class="hint" id="pv-count"></div>
+                </div>
+                <div class="pv-src">
+                  <a id="pv-open" class="srcbtn" target="_blank" rel="noopener" href="#" title="查看原文"><svg><use href="#i-ext"/></svg></a>
+                </div>
+              </div>
+              <div id="pv-msg" class="msg hidden"></div>
+              <div id="pv-rows" class="pv-fields"></div>
+              <div class="pv-actions">
+                <button id="btn-ignore" class="btn btn-ghost">忽略此条</button>
+                <span class="grow"></span>
+                <span id="pv-changed" class="hint"></span>
+                <button id="btn-confirm" class="btn btn-primary"><svg width="14" height="14"><use href="#i-check"/></svg>确认入库</button>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+</div>
+
+<script src="/admin/admin.js"></script>
+</body>
+</html>

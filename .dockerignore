@@ -1,0 +1,23 @@
+node_modules
+npm-debug.log*
+.git
+.gitignore
+.env
+.env.*
+!.env.production.example
+
+# 本地运行产生的数据/日志，绝不能打进镜像
+data/
+*.log
+policy-api/*.log
+cookiejar.txt
+
+# 调试与一次性脚本产物
+e2e-shots/
+docs/tmp_main.js
+docs/data-quality/
+.workbuddy/
+scripts/_*
+
+# 前端 SPA 由部署脚本拷入 ./spa/client，不在这里构建
+spa/node_modules

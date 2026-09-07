@@ -1,0 +1,53 @@
+# ============================================================
+# 政策知识库 · systemd 单元（裸机 / 云服务器部署）
+#
+# 安装：
+#   sudo cp deploy/systemd/policy-kb.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now policy-kb
+#   sudo systemctl status policy-kb
+#   sudo journalctl -u policy-kb -f
+# ============================================================
+
+[Unit]
+Description=Policy Knowledge Base (Feishu Web App)
+Documentation=file:///opt/policy-kb/docs/生产部署手册.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/policy-kb
+
+# .env 必须是 KEY=VALUE 单行格式，值里不要有空格或未转义的引号
+EnvironmentFile=/opt/policy-kb/.env
+Environment=NODE_ENV=production
+Environment=PORT=3000
+
+ExecStart=/usr/bin/node policy-api/src/server.js
+
+# 崩溃自动拉起
+Restart=always
+RestartSec=5
+# 优雅停止：先发 SIGTERM，最多等 30s
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=policy-kb
+
+# ── 安全加固 ─────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# data/ 需要写 db.json，因此显式放行
+ReadWritePaths=/opt/policy-kb/data
+# 兜底：日志目录
+ReadWritePaths=/var/log/policy-kb
+
+[Install]
+WantedBy=multi-user.target

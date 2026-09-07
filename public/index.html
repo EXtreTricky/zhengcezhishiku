@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>飞书自建网站应用</title>
+    <style>
+      :root {
+        --bg: #f7f8fa;
+        --card: #ffffff;
+        --border: #e5e6eb;
+        --text: #1d2129;
+        --muted: #86909c;
+        --brand: #3370ff;
+        --warn-bg: #fff7e6;
+        --warn-border: #ffd591;
+        --warn-text: #ad6800;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+        padding: 24px 0;
+      }
+      .card {
+        width: min(560px, calc(100vw - 32px));
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 32px;
+      }
+      h1 { margin: 0 0 4px; font-size: 20px; font-weight: 500; }
+      .sub { margin: 0 0 24px; color: var(--muted); font-size: 13px; }
+      .row { display: flex; align-items: center; gap: 12px; }
+      .avatar {
+        width: 48px; height: 48px; border-radius: 50%;
+        background: #3370ff; color: #fff;
+        display: grid; place-items: center;
+        font-size: 18px; font-weight: 500;
+        object-fit: cover; flex: none;
+      }
+      .name { font-size: 16px; font-weight: 500; }
+      .meta { color: var(--muted); font-size: 12px; word-break: break-all; }
+      button {
+        border: none; background: var(--brand); color: #fff;
+        padding: 9px 18px; border-radius: 6px; font-size: 14px; cursor: pointer;
+        font-family: inherit;
+      }
+      button.ghost { background: #fff; color: var(--text); border: 1px solid var(--border); }
+      button:hover { opacity: 0.88; }
+      pre {
+        background: #f2f3f5; padding: 12px 14px; border-radius: 8px;
+        overflow-x: auto; font-size: 12px; color: #333; margin: 12px 0 0;
+      }
+      .muted { color: var(--muted); font-size: 12px; }
+      .mt { margin-top: 20px; }
+      .banner {
+        background: var(--warn-bg); border: 1px solid var(--warn-border);
+        color: var(--warn-text); border-radius: 8px;
+        padding: 10px 14px; font-size: 12px; margin-bottom: 20px;
+      }
+      a { color: var(--brand); text-decoration: none; }
+      .kv { display: grid; grid-template-columns: 88px 1fr; gap: 6px 12px; font-size: 13px; margin-top: 8px; }
+      .kv dt { color: var(--muted); }
+      .kv dd { margin: 0; word-break: break-all; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <div class="banner" id="banner" hidden>
+        本地预览模式：当前展示的是模拟登录态，未连接飞书。<a href="?">切回真实登录</a>
+      </div>
+
+      <h1>飞书自建网站应用</h1>
+      <p class="sub">代码跑在自有服务器，飞书仅提供工作台入口与单点登录</p>
+
+      <div id="guest" hidden>
+        <p class="muted">当前未登录。点击按钮跳转飞书授权，若已在飞书客户端内登录则无需扫码。</p>
+        <a href="/auth/login"><button>使用飞书登录</button></a>
+        <p class="mt muted" style="margin-bottom:0">
+          本地没配飞书也想看效果？<a href="?mock=1">点这里进入预览模式</a>
+        </p>
+      </div>
+
+      <div id="user" hidden>
+        <div class="row">
+          <div class="avatar" id="avatarText"></div>
+          <img class="avatar" id="avatar" alt="" hidden />
+          <div>
+            <div class="name" id="name"></div>
+            <div class="meta" id="meta"></div>
+          </div>
+        </div>
+
+        <dl class="kv">
+          <dt>open_id</dt><dd id="kOpenId"></dd>
+          <dt>tenant_key</dt><dd id="kTenant"></dd>
+        </dl>
+
+        <div class="mt">
+          <button class="ghost" id="btnEgress">测试服务器出网（查看出口 IP）</button>
+          <pre id="egress" hidden></pre>
+        </div>
+
+        <div class="mt">
+          <button class="ghost" id="btnHello">调用受保护业务接口 /api/hello</button>
+          <pre id="hello" hidden></pre>
+        </div>
+
+        <div class="mt">
+          <button class="ghost" id="btnLogout">退出登录</button>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      // ---------------------------------------------------------------
+      // 本地预览：直接双击本文件（file://）或加 ?mock=1 时使用模拟数据，
+      // 不需要飞书配置、不需要起服务器。联调完成前先看界面就这么干。
+      // ---------------------------------------------------------------
+      const MOCK_USER = {
+        authenticated: true,
+        name: '张伟',
+        sub: 'ou_ba0a6a1e0d5b2c3f4a5b6c7d8e9f0a1b',
+        union_id: 'on_8d9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b',
+        tenant_key: 'tenant_demo_2026',
+        email: 'zhangwei@example.com',
+        avatar: '',
+      };
+      const MOCK_EGRESS = { ok: true, egressIp: '203.0.113.42', rttMs: 86, note: '预览模式：模拟数据' };
+      const MOCK_HELLO = { message: '你好，张伟', openId: MOCK_USER.sub };
+
+      const params = new URLSearchParams(location.search);
+      const isMock = location.protocol === 'file:' || params.get('mock') === '1';
+
+      function render(data) {
+        if (!data.authenticated) {
+          document.getElementById('guest').hidden = false;
+          return;
+        }
+        document.getElementById('user').hidden = false;
+        document.getElementById('name').textContent = data.name || '（未获取到姓名）';
+        document.getElementById('meta').textContent = data.email || '';
+        document.getElementById('kOpenId').textContent = data.sub || '-';
+        document.getElementById('kTenant').textContent = data.tenant_key || '-';
+
+        const img = document.getElementById('avatar');
+        const txt = document.getElementById('avatarText');
+        if (data.avatar) {
+          img.src = data.avatar;
+          img.hidden = false;
+          txt.hidden = true;
+        } else {
+          txt.textContent = (data.name || '?').slice(0, 1);
+          txt.hidden = false;
+          img.hidden = true;
+        }
+      }
+
+      async function callApi(path, mockData) {
+        if (isMock) {
+          await new Promise((r) => setTimeout(r, 320));
+          return mockData;
+        }
+        const res = await fetch(path);
+        return res.json();
+      }
+
+      async function load() {
+        if (isMock) {
+          document.getElementById('banner').hidden = false;
+          render(MOCK_USER);
+          return;
+        }
+        try {
+          const res = await fetch('/api/me');
+          render(await res.json());
+        } catch {
+          // 后端没起 / 直接用 file:// 打开，回退到预览模式
+          document.getElementById('banner').hidden = false;
+          render(MOCK_USER);
+        }
+      }
+
+      document.getElementById('btnEgress').onclick = async () => {
+        const box = document.getElementById('egress');
+        box.hidden = false;
+        box.textContent = '请求中…';
+        box.textContent = JSON.stringify(await callApi('/api/egress', MOCK_EGRESS), null, 2);
+      };
+
+      document.getElementById('btnHello').onclick = async () => {
+        const box = document.getElementById('hello');
+        box.hidden = false;
+        box.textContent = '请求中…';
+        box.textContent = JSON.stringify(await callApi('/api/hello', MOCK_HELLO), null, 2);
+      };
+
+      document.getElementById('btnLogout').onclick = async () => {
+        if (isMock) {
+          location.href = location.pathname;
+          return;
+        }
+        await fetch('/auth/logout', { method: 'POST' });
+        location.reload();
+      };
+
+      load();
+    </script>
+  </body>
+</html>
