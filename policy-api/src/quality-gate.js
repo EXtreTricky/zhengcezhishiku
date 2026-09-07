@@ -20,11 +20,11 @@ const HOST_BLACKLIST = [
   '163.com', 'baidu.com', 'qq.com', 'weixin', 'csdn.net', 'zhihu.com',
   'xueqiu.com', '36kr.com', 'ithome.com', 'jiemian.com', 'caixin.com',
   'thepaper.cn', 'bjnews.com.cn', 'stcn.com', 'yicai.com', 'nbd.com.cn',
-  'ifeng.com', 'people.com.cn', 'xinhuanet.com', 'chinanews.com.cn',
+  'ifeng.com',
 ];
 
 /** 政府域名后缀（白名单）：.gov.cn 及其子域 */
-const isGovHost = (host) => /(^|\.)gov\.cn$/.test(host) || /(^|\.)mohrss\.gov\.cn$/.test(host);
+const isGovHost = (host) => /(^|\.)gov\.cn$/.test(host) || /(^|\.)mohrss\.gov\.cn$/.test(host) || /\.gov\./.test(host);
 
 function getHost(url) {
   try {

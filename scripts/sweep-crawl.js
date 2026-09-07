@@ -125,18 +125,23 @@ async function runBatch({ limit, region, category, all }) {
   let added = 0;
   let failed = 0;
   let aiExpanded = 0; // 统计 AI 扩了多少次
+
+  // AI 扩词：为每个任务生成搜索变体词，提升命中率
+  const aiExpansionEnabled = llm.llmEnabled();
+
   for (let i = 0; i < tasks.length; i++) {
     const t = tasks[i];
     const label = `[${i + 1}/${tasks.length}] ${t.region} × ${t.keyword}`;
     try {
-      let items = await crawler.crawlPolicies({ keyword: t.keyword, region: t.region });
-      // AI 扩展：基础词命中为0时，用 DeepSeek 生成变体词重新搜索（最多 2 轮）
+      // 先用 AI 生成变体词搜索（主动扩词策略）
+      let items = [];
       let expanded = false;
-      if (items.length === 0 && llm.llmEnabled()) {
-        const terms = await llm.aiExpandSearchTerms({ province: t.region, category: t.keyword, count: 3 }).catch(() => null);
+
+      if (aiExpansionEnabled) {
+        const terms = await llm.aiExpandSearchTerms({ province: t.region, category: t.keyword, count: 5 }).catch(() => null);
         if (terms && terms.length > 0) {
-          console.log(`[AI] ${label} 基础词无命中，尝试 ${terms.length} 个变体词...`);
-          for (const term of terms) {
+          console.log(`[AI] ${label} 使用 ${terms.length} 个变体词搜索...`);
+          for (const term of terms.slice(0, 3)) {
             const extItems = await crawler.crawlPolicies({ keyword: term, region: t.region }).catch(() => []);
             items = items.concat(extItems);
             if (extItems.length > 0) {
@@ -146,6 +151,11 @@ async function runBatch({ limit, region, category, all }) {
           expanded = true;
           aiExpanded += terms.length;
         }
+      }
+
+      // 如果 AI 扩词后仍无命中，再用原始关键词搜索
+      if (items.length === 0) {
+        items = await crawler.crawlPolicies({ keyword: t.keyword, region: t.region });
       }
       let addN = 0;
       for (const it of items) {
@@ -173,7 +183,7 @@ async function runBatch({ limit, region, category, all }) {
       console.log(`${label} → 失败: ${err.message}`);
     }
     db.save();
-    if (i < tasks.length - 1) await sleep(1200); // 防反爬限速
+    if (i < tasks.length - 1) await sleep(1500); // 防反爬限速
   }
   const remaining = ensureTasks().filter((t) => t.status !== 'done').length;
   process.stdout.write('\n__RESULT__' + JSON.stringify({ ok: true, done: tasks.length, hits, added, failed, remaining, aiExpanded }));

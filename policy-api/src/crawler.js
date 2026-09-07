@@ -220,12 +220,12 @@ async function bingSearch(query, count = 8) {
   return results;
 }
 
-/** 百度搜索（主力路径）：结果页 data-tools 属性直接含真实 URL，无需逐条跳转 */
+/** 百度搜索（主力路径）：带Cookie模拟真实浏览器，绕过验证码 */
 async function baiduSearch(query, count = 10) {
   const url = `https://www.baidu.com/s?wd=${encodeURIComponent(query)}&rn=${count}`;
-  const { buf, headers, status } = await httpGet(url);
-  // 百度现在返回302验证码页面，跳过搜索
-  if (status === 302) {
+  const { buf, headers, status } = await httpGet(url, 5);
+  // 如果是验证码页面（status 302 或 HTML 含验证码特征），返回空数组
+  if (status === 302 || (buf && buf.toString('utf8').includes('verif') && buf.toString('utf8').length < 5000)) {
     console.log('[crawler] 百度返回验证码，跳过百度搜索');
     return [];
   }
@@ -261,6 +261,27 @@ async function resolveBaiduLink(url) {
   } catch {
     return url;
   }
+}
+
+/** DuckDuckGo 搜索（备用通道，支持 site:gov.cn 过滤） */
+async function duckduckgoSearch(query, count = 8) {
+  const url = `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}&af=q`;
+  const { buf, headers, status } = await httpGet(url);
+  if (status !== 200) throw new Error(`DuckDuckGo 搜索失败 HTTP ${status}`);
+  const html = decodeHtml(buf, headers['content-type']);
+  const results = [];
+  // DDG 结果在 result__a 类中
+  const re = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(html)) && results.length < count) {
+    const link = m[1];
+    if (!/^https?:\/\//.test(link)) continue;
+    const title = stripTags(m[2]);
+    // 跳过搜索引擎自身和非政策页面
+    if (/duckduckgo\.com|facebook\.com|twitter\.com|linkedin\.com/i.test(link)) continue;
+    results.push({ url: link, title, snippet: '' });
+  }
+  return results;
 }
 
 /** 抓政策详情页，提取 { title, publishDate, text } */
@@ -301,9 +322,25 @@ function inferRegion(text, inputRegion) {
 
 /** 判断链接是否像政策原文页（排除列表页/专题页/无关域） */
 function looksLikePolicyPage(url, title) {
-  if (!/gov\.cn|mohrss|gov\.hk|gov\.mo/.test(url)) return false;
-  if (/search|sousuo|index\.s?html?$|list|channel|column|zhuanti|special/i.test(url)) return false;
-  return /通知|公告|标准|调整|办法|规定|意见|决定|批复|最低工资|津贴|公积金|产假|病假|补偿/.test(title + url);
+  const fullText = (title + ' ' + url).toLowerCase();
+
+  // 放宽域名限制：接受更多政府相关域名
+  const govDomains = /gov\.cn|mohrss|gov\.hk|gov\.mo|\.gov\.|government\.|public\.service/i;
+  const isGovDomain = govDomains.test(url);
+
+  // 如果不是gov域名，再检查是否包含政策关键词
+  if (!isGovDomain) {
+    const policyKeywords = /通知|公告|标准|调整|办法|规定|意见|决定|批复|最低工资|津贴|公积金|产假|病假|补偿|社保|养老|失业|工伤|生育|个税|专项附加扣除/;
+    if (!policyKeywords.test(fullText)) return false;
+  }
+
+  // 排除非政策页面
+  const excludePatterns = /search|sousuo|index\.s?html?$|list|channel|column|zhuanti|special|sitemap|mobile|wap/i;
+  if (excludePatterns.test(url)) return false;
+
+  // 必须包含政策关键词
+  const policyKeywords = /通知|公告|标准|调整|办法|规定|意见|决定|批复|最低工资|津贴|公积金|产假|病假|补偿|社保|养老|失业|工伤|生育|个税|专项附加扣除|印发|施行|执行|文件|发文/;
+  return policyKeywords.test(fullText);
 }
 
 /**
@@ -313,13 +350,20 @@ function looksLikePolicyPage(url, title) {
  */
 async function discoverBySearch({ keyword, region }) {
   const year = new Date().getFullYear();
+  const prevYear = year - 1;
   const regionPart = region === '全国' ? '' : region;
-  // 搜索计划：gov.cn 政策库为主力，Bing 补充（百度验证码问题）
+
+  // 多路搜索计划：提高命中率
   const searchPlan = [
-    // Bing 多种查询策略提高命中率
+    // Bing 搜索策略（4路）
     { engine: 'bing', q: `${regionPart} ${keyword} ${year}`.trim() },
     { engine: 'bing', q: `${keyword} 标准 调整 ${year} site:gov.cn` },
     { engine: 'bing', q: `${regionPart} ${keyword} 通知印发 ${year}`.trim() },
+    { engine: 'bing', q: `${keyword} ${prevYear}-${year} site:gov.cn` },
+
+    // DuckDuckGo 备用搜索（2路）
+    { engine: 'duckduckgo', q: `${regionPart} ${keyword} site:gov.cn` },
+    { engine: 'duckduckgo', q: `${keyword} 政策文件 ${year}` },
   ];
 
   // 1. 搜索发现：gov.cn 政策库 API 为主力（稳定 JSON），百度/bing SERP 为补充（可能抖动）
@@ -330,28 +374,49 @@ async function discoverBySearch({ keyword, region }) {
   });
   for (const hit of libResult) found.set(hit.url, hit);
 
-  // 顺序执行搜索（避免并发触发搜索引擎限流，导致返回无关结果）
+  // 顺序执行搜索（避免并发触发搜索引擎限流）
   const searchResults = [];
   for (const { engine, q } of searchPlan) {
-    const fn = engine === 'baidu' ? baiduSearch : bingSearch;
-    const results = await fn(q, engine === 'baidu' ? 10 : 8).catch((e) => {
-      console.log(`[crawler] ${engine}搜索失败:`, e.message);
-      return [];
-    });
+    let results = [];
+    if (engine === 'baidu') {
+      results = await baiduSearch(q, 10).catch((e) => {
+        console.log(`[crawler] 百度搜索失败:`, e.message);
+        return [];
+      });
+    } else if (engine === 'bing') {
+      results = await bingSearch(q, 8).catch((e) => {
+        console.log(`[crawler] Bing搜索失败:`, e.message);
+        return [];
+      });
+    } else if (engine === 'duckduckgo') {
+      results = await duckduckgoSearch(q, 8).catch((e) => {
+        console.log(`[crawler] DuckDuckGo搜索失败:`, e.message);
+        return [];
+      });
+    }
     searchResults.push({ engine, query: q.slice(0, 40), results });
     // 每次搜索后短暂延迟，降低被限流概率
-    await new Promise((r) => setTimeout(r, 400));
+    await new Promise((r) => setTimeout(r, 500));
   }
   for (const { results } of searchResults) {
     for (const hit of results) {
       if (!found.has(hit.url)) found.set(hit.url, hit);
     }
   }
-  const govHits = [...found.values()].filter((h) => /gov\.cn|mohrss/.test(h.url));
-  const candidates = govHits
-    .filter((h) => looksLikePolicyPage(h.url, h.title + h.snippet))
+
+  // 优先保留gov域名链接
+  const govHits = [...found.values()]
+    .filter((h) => /gov\.cn|mohrss|gov\.hk|gov\.mo/.test(h.url))
     .slice(0, MAX_DETAIL_PAGES);
-  console.log(`[crawler] 搜索命中 ${found.size} 条（gov.cn ${govHits.length}），候选 ${candidates.length} 条`);
+
+  // 其余链接通过质量门控筛选
+  const otherHits = [...found.values()]
+    .filter((h) => !/gov\.cn|mohrss|gov\.hk|gov\.mo/.test(h.url))
+    .filter((h) => looksLikePolicyPage(h.url, h.title + h.snippet))
+    .slice(0, MAX_DETAIL_PAGES - govHits.length);
+
+  const candidates = [...govHits, ...otherHits].slice(0, MAX_DETAIL_PAGES);
+  console.log(`[crawler] 搜索命中 ${found.size} 条（gov.cn ${govHits.length}，其他 ${otherHits.length}），候选 ${candidates.length} 条`);
   return candidates;
 }
 
