@@ -166,17 +166,57 @@ async function bingSearch(query, count = 8) {
   if (status !== 200) throw new Error(`搜索失败 HTTP ${status}`);
   const html = decodeHtml(buf, headers['content-type']);
   const results = [];
-  const re = /<li class="b_algo"[\s\S]*?<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?(?:<p[^>]*>([\s\S]*?)<\/p>)?/g;
-  let m;
-  while ((m = re.exec(html)) && results.length < count) {
-    const link = m[1];
-    if (!/^https?:\/\//.test(link)) continue;
-    results.push({
-      url: link,
-      title: stripTags(m[2]),
-      snippet: stripTags(m[3] || ''),
-    });
+
+  // Bing 新版 HTML 结构：b_algo 块中包含日期和片段文本
+  // 提取所有包含政策链接的块
+  const algoMatches = html.match(/<li class="b_algo"[^>]*>[\s\S]{0,3000}?<\/li>/gi) || [];
+
+  for (const block of algoMatches) {
+    if (results.length >= count) break;
+
+    // 从块中提取所有 HTTPS 链接
+    const linkMatches = block.match(/href="(https?:\/\/[^"]+)"/gi) || [];
+    const uniqueLinks = [...new Set(linkMatches.map(m => m.slice(6, -1).trim()))];
+
+    // 优先找 gov.cn / mohrss 相关的政策链接
+    let policyUrl = '';
+    for (const link of uniqueLinks) {
+      if (/gov\.cn|mohrss|gov\.hk|gov\.mo/.test(link) && !/search|images|videos|maps|dict|academic/.test(link)) {
+        policyUrl = link;
+        break;
+      }
+    }
+    // 兜底：取第一个合法链接
+    if (!policyUrl) {
+      for (const link of uniqueLinks) {
+        if (/^https?:\/\//.test(link) && !/bing\.com/.test(link)) {
+          policyUrl = link;
+          break;
+        }
+      }
+    }
+
+    if (!policyUrl) continue;
+
+    // 提取标题（可能不在 h2 中，尝试多种模式）
+    let title = '';
+    const titleMatch = block.match(/>([^<]{10,150}?)(?:\d{4}[-年/\u4e00-\u9fa5]|&ensp)/i);
+    if (titleMatch) title = stripTags(titleMatch[1]).trim();
+
+    // 提取片段（从 snippet 文本中获取）
+    let snippet = '';
+    const snippetMatch = block.match(/<p[^>]*class="[^"]*lineclamp[^"]*"[^>]*>([\s\S]*?)<\/p>/i);
+    if (snippetMatch) snippet = stripTags(snippetMatch[1]).trim();
+
+    // 如果标题为空，从片段或 URL 推断
+    if (!title) {
+      const urlMatch = policyUrl.match(/\/([^/]+)\.html$/);
+      title = urlMatch ? urlMatch[1] : policyUrl.slice(-50);
+    }
+
+    results.push({ url: policyUrl, title, snippet });
   }
+
   return results;
 }
 
@@ -184,6 +224,11 @@ async function bingSearch(query, count = 8) {
 async function baiduSearch(query, count = 10) {
   const url = `https://www.baidu.com/s?wd=${encodeURIComponent(query)}&rn=${count}`;
   const { buf, headers, status } = await httpGet(url);
+  // 百度现在返回302验证码页面，跳过搜索
+  if (status === 302) {
+    console.log('[crawler] 百度返回验证码，跳过百度搜索');
+    return [];
+  }
   if (status !== 200) throw new Error(`百度搜索失败 HTTP ${status}`);
   const html = decodeHtml(buf, headers['content-type']);
   const results = [];
@@ -269,11 +314,12 @@ function looksLikePolicyPage(url, title) {
 async function discoverBySearch({ keyword, region }) {
   const year = new Date().getFullYear();
   const regionPart = region === '全国' ? '' : region;
-  // 百度为主（中文查询理解好）：带地区 + 不带地区两路；bing 一路兜底（对中文长查询易降级）
+  // 搜索计划：gov.cn 政策库为主力，Bing 补充（百度验证码问题）
   const searchPlan = [
-    { engine: 'baidu', q: `${regionPart} ${keyword} 通知 ${year}`.trim() },
-    { engine: 'baidu', q: `${keyword} 调整 标准 ${year} site:gov.cn` },
+    // Bing 多种查询策略提高命中率
     { engine: 'bing', q: `${regionPart} ${keyword} ${year}`.trim() },
+    { engine: 'bing', q: `${keyword} 标准 调整 ${year} site:gov.cn` },
+    { engine: 'bing', q: `${regionPart} ${keyword} 通知印发 ${year}`.trim() },
   ];
 
   // 1. 搜索发现：gov.cn 政策库 API 为主力（稳定 JSON），百度/bing SERP 为补充（可能抖动）
@@ -292,9 +338,9 @@ async function discoverBySearch({ keyword, region }) {
       console.log(`[crawler] ${engine}搜索失败:`, e.message);
       return [];
     });
-    searchResults.push({ engine, results });
+    searchResults.push({ engine, query: q.slice(0, 40), results });
     // 每次搜索后短暂延迟，降低被限流概率
-    await new Promise((r) => setTimeout(r, 300));
+    await new Promise((r) => setTimeout(r, 400));
   }
   for (const { results } of searchResults) {
     for (const hit of results) {

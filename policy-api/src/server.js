@@ -384,3 +384,53 @@ app.post('/api/cron/local-run', requireUser, async (req, res, next) => {
     next(err);
   }
 });
+
+// GET /api/health → 健康检查（无需鉴权，供进程守护和监控使用）
+app.get('/api/health', (req, res) => {
+  try {
+    const dbData = db.getDb();
+    const health = {
+      status: 'ok',
+      uptime: process.uptime(),
+      timestamp: new Date().toISOString(),
+      crawlQueue: dbData.crawlQueue?.length || 0,
+      policies: dbData.policies?.length || 0,
+      crawlTasksDone: (dbData.crawlTasks || []).filter(t => t.status === 'done').length,
+      crawlTasksTotal: (dbData.crawlTasks || []).length,
+      cron: cron.getStatus(),
+    };
+    res.json(health);
+  } catch (err) {
+    res.status(500).json({ status: 'error', error: err.message });
+  }
+});
+
+// GET /api/crawl/stats → 爬虫统计（无需鉴权）
+app.get('/api/crawl/stats', (req, res) => {
+  try {
+    const dbData = db.getDb();
+    const tasks = dbData.crawlTasks || [];
+    const done = tasks.filter(t => t.status === 'done').length;
+    const failed = tasks.filter(t => t.status === 'failed').length;
+    const pending = tasks.filter(t => t.status === 'todo').length;
+    
+    // 按类别统计
+    const byCategory = {};
+    tasks.forEach(t => {
+      const cat = t.keyword || '未知';
+      if (!byCategory[cat]) byCategory[cat] = { total: 0, done: 0, failed: 0 };
+      byCategory[cat].total++;
+      if (t.status === 'done') byCategory[cat].done++;
+      if (t.status === 'failed') byCategory[cat].failed++;
+    });
+    
+    res.json({
+      queue: dbData.crawlQueue?.length || 0,
+      policies: dbData.policies?.length || 0,
+      tasks: { total: tasks.length, done, failed, pending },
+      byCategory,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
