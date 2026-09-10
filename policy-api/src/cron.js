@@ -19,6 +19,7 @@ const db = require('../../src/db');
 const { judge } = require('./quality-gate');
 const { spawn } = require('child_process');
 const path = require('path');
+const { getSweepLockStatus } = require('./sweep-lock');
 
 // 配置统一走 getConfig() 动态读取 process.env，支持运行时通过 /api/cron/schedule 热更新
 
@@ -27,30 +28,59 @@ let lastRun = null;
 
 /**
  * 启动一次本地矩阵滚动巡检（实际抓取政府站新政策）。
- * 复用 scripts/sweep-crawl.js：队列耗尽自动重置、URL 级去重只加新政策。
+ * 复用 scripts/sweep-crawl.js：日常默认按当天增量巡检，URL 级去重只加新政策。
  * @param {{all?:boolean, limit?:number}} opts
  */
 function runLocalSweep(opts = {}) {
   return new Promise((resolve) => {
+    const lockState = getSweepLockStatus();
+    if (lockState.locked) {
+      return resolve({ code: 2, busy: true, error: `已有巡检运行中（pid=${lockState.lock?.pid || '?'}）`, result: { ok:false, busy:true, error:'已有巡检运行中' } });
+    }
     const args = ['scripts/sweep-crawl.js', 'run'];
     if (opts.all) args.push('--all');
-    else if (opts.limit) args.push('--limit', String(opts.limit));
+    else {
+      if (opts.newCycle) args.push('--new-cycle');
+      if (opts.limit) args.push('--limit', String(opts.limit));
+      if (opts.region) args.push('--region', String(opts.region));
+      if (opts.category) args.push('--category', String(opts.category));
+    }
+    args.push('--mode', opts.mode === 'bootstrap' ? 'bootstrap' : 'daily');
+    const env = { ...process.env, SWEEP_OWNER: opts.owner || (opts.deep ? 'compensation' : 'cron') };
+    if (opts.deep) env.CRAWL_SEARCH_DEPTH = 'deep';
     const child = spawn(process.execPath, args, {
       cwd: path.join(__dirname, '..', '..'),
-      timeout: 0,
-      maxBuffer: 64 * 1024 * 1024,
+      env,
+      windowsHide: true,
     });
     let out = '';
-    child.stdout.on('data', (d) => (out += d));
-    child.stderr.on('data', (d) => (out += d));
-    child.on('error', (e) => resolve({ code: -1, error: e.message, result: null }));
+    let settled = false;
+    const timeoutMs = Math.max(60_000, parseInt(process.env.SWEEP_RUN_TIMEOUT_MS || String(20 * 60 * 1000), 10) || 20 * 60 * 1000);
+    const finish = (payload) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(payload);
+    };
+    const timer = setTimeout(() => {
+      try {
+        if (process.platform === 'win32' && child.pid) {
+          const { execFile } = require('child_process');
+          execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide:true }, () => {});
+        } else child.kill('SIGTERM');
+      } catch (_) {}
+      finish({ code: -2, timeout: true, error: `巡检超过 ${Math.round(timeoutMs/60000)} 分钟已终止`, result: null, raw: out.slice(-1500) });
+    }, timeoutMs);
+    child.stdout.on('data', (d) => { out += d; if (out.length > 4 * 1024 * 1024) out = out.slice(-2 * 1024 * 1024); });
+    child.stderr.on('data', (d) => { out += d; if (out.length > 4 * 1024 * 1024) out = out.slice(-2 * 1024 * 1024); });
+    child.on('error', (e) => finish({ code: -1, error: e.message, result: null }));
     child.on('close', (code) => {
       const m = out.lastIndexOf('__RESULT__');
       let result = null;
       if (m !== -1) {
         try { result = JSON.parse(out.slice(m + '__RESULT__'.length)); } catch (_) {}
       }
-      resolve({ code, result, raw: out.slice(-1500) });
+      finish({ code, result, raw: out.slice(-1500), busy: !!result?.busy });
     });
   });
 }
@@ -74,6 +104,40 @@ function msUntilNext() {
   return next.getTime() - now.getTime();
 }
 
+
+function pickDueCompensation() {
+  const d = db.getDb();
+  const now = Date.now();
+  return (d.compensationQueue || [])
+    .filter((q) => ['queued','retry'].includes(q.status) && (!q.nextRunAt || Date.parse(q.nextRunAt) <= now))
+    .sort((a,b)=>(b.priority||0)-(a.priority||0) || Date.parse(a.createdAt||0)-Date.parse(b.createdAt||0))[0] || null;
+}
+
+async function runDueCompensation(log) {
+  const q = pickDueCompensation();
+  if (!q) return null;
+  q.status='running'; q.attempts=(q.attempts||0)+1; q.lastRunAt=new Date().toISOString();
+  db.save();
+  log.info(`优先执行补偿任务：${q.region} / ${q.mode} / priority=${q.priority}`);
+  const r = await runLocalSweep({ region:q.region, limit:13, deep:true, owner:'compensation', mode:'daily' });
+  db.reload();
+  const fresh=(db.getDb().compensationQueue||[]).find((x)=>x.id===q.id);
+  if (fresh && fresh.status==='running') {
+    const ok=r.code===0 && r.result && r.result.ok;
+    if (ok) {
+      const h=(db.getDb().sourceHealth||[]).find((x)=>x.region===q.region);
+      if (h && h.status==='healthy') { fresh.status='done'; fresh.resolvedAt=new Date().toISOString(); }
+      else { fresh.status='retry'; fresh.nextRunAt=new Date(Date.now()+Math.min(24,2**Math.min(fresh.attempts||1,5))*3600000).toISOString(); }
+    } else {
+      fresh.status=(fresh.attempts||0)>=5?'manual':'retry';
+      fresh.lastError=(r.error || r.result?.error || 'compensation failed').slice(0,300);
+      fresh.nextRunAt=new Date(Date.now()+Math.min(24,2**Math.min(fresh.attempts||1,5))*3600000).toISOString();
+    }
+    db.save();
+  }
+  return { taskId:q.id, region:q.region, result:r };
+}
+
 /**
  * 执行一次爬取任务
  */
@@ -83,13 +147,28 @@ async function runCrawl(bitableClient, policySources) {
   const started = Date.now();
 
   try {
+    // 异常来源优先于普通滚动任务，避免“已检测到漏抓但补偿队列无人消费”。
+    const compensation = await runDueCompensation(log);
+    if (compensation) log.info(`补偿任务执行结束：${compensation.region}`);
+
     // 从爬虫汇总表拉取最新数据
     const crawlAppToken = process.env.FEISHU_CRAWL_APP_TOKEN;
     const crawlTableId = process.env.FEISHU_CRAWL_TABLE_ID;
 
+    // 一轮 cron 若已经执行了补偿，不再紧接着再跑 15 个普通格子，避免双倍网络负载。
+    if (compensation && (!crawlAppToken || !crawlTableId)) {
+      lastRun = new Date().toISOString();
+      return { success:true, mode:'compensation_only', compensation };
+    }
+
     if (!crawlAppToken || !crawlTableId) {
-      log.info('未配置爬虫汇总表（FEISHU_CRAWL_APP_TOKEN / FEISHU_CRAWL_TABLE_ID），跳过');
-      return { success: false, reason: 'no_crawl_table_config' };
+      // 没有独立飞书采集汇总表时，不能把定时任务“空跑掉”。
+      // 自动退回本地 31 省矩阵巡检，确保 CRON_ENABLED=true 真正产生采集工作。
+      const limit = Math.max(1, Math.min(100, parseInt(process.env.CRON_SWEEP_LIMIT || '15', 10) || 15));
+      log.info(`未配置爬虫汇总表，切换 local_sweep（limit=${limit}）`);
+      const local = await runLocalSweep({ limit, owner:'cron', mode:'daily' });
+      lastRun = new Date().toISOString();
+      return { success: local.code === 0 && !!(local.result && local.result.ok), mode: 'local_sweep', ...local };
     }
 
     const records = await bitableClient.listAllRecords(crawlAppToken, crawlTableId);
@@ -286,13 +365,14 @@ async function runNow() {
 
 /**
  * 手动触发一次本地矩阵滚动巡检（无飞书汇总表时作为默认方案）。
- * 复用 scripts/sweep-crawl.js：队列耗尽自动重置、URL 级去重只加新政策。
+ * 复用 scripts/sweep-crawl.js：日常默认按当天增量巡检，URL 级去重只加新政策。
  */
-async function runLocalNow() {
+async function runLocalNow(opts = {}) {
   const log = getLogger();
   log.info('[cron] 运行本地矩阵滚动巡检…');
-  const r = await runLocalSweep({ all: false, limit: 15 });
-  const res = { ok: true, source: 'local_sweep' };
+  const r = await runLocalSweep({ all: false, limit: 15, newCycle: !!opts.newCycle });
+  const ok = r.code === 0 && !!(r.result && r.result.ok);
+  const res = { ok, source: 'local_sweep' };
   if (r.result) {
     res.hits = r.result.hits;
     res.added = r.result.added;
@@ -304,6 +384,7 @@ async function runLocalNow() {
     res.error = r.error || '子进程无结果';
     res.raw = r.raw;
   }
+  if (!ok && !res.error) res.error = r.result?.error || `巡检进程退出码 ${r.code}`;
   lastRun = new Date().toISOString();
   return res;
 }
@@ -344,15 +425,23 @@ function startScheduler(bitableClient, policySources) {
     return;
   }
 
-  // 无飞书汇总 → 本地 sweep 循环（每 N 小时跑一次，默认 6h）
+  // 无飞书汇总 → 本地 sweep 循环。CRON_ENABLED=false 必须同样彻底关闭，
+  // 不能因为缺飞书汇总表就绕过开关自行启动。
+  if (!cfg.enabled) {
+    console.log('[cron] 定时爬取未启用（本地 sweep 模式同样遵守 CRON_ENABLED=false）');
+    return;
+  }
   const intervalHours = cfg.intervalHours > 0 ? cfg.intervalHours : 6;
   const log2 = getLogger();
   log2.info(`定时爬取已启用（本地 sweep 模式，飞书汇总表未配置），每 ${intervalHours}h 一轮`);
 
   timer = setTimeout(async function tickLocal() {
-    try { await runLocalNow(); } catch (_) {}
-    timer = setTimeout(tickLocal, intervalHours * 3600 * 1000);
-  }, intervalHours * 3600 * 1000); // 服务启动即启动，不卡首小时
+    try {
+      if (getConfig().enabled) await runLocalNow({ newCycle:true });
+    } catch (_) {}
+    if (getConfig().enabled) timer = setTimeout(tickLocal, intervalHours * 3600 * 1000);
+    else timer = null;
+  }, intervalHours * 3600 * 1000);
 }
 
 function stopScheduler() {

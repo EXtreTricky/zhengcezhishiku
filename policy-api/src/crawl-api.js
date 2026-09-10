@@ -21,6 +21,14 @@ const { requireUser } = require('./auth');
 const { POLICY_SOURCES } = require('./policy-sources');
 const { msToDateText } = require('../../src/bitable');
 const { judge } = require('./quality-gate');
+const {
+  REGIONS, CATEGORY_KEYWORDS: MATRIX_CATEGORY_KEYWORDS, PROVINCES, REGION_BATCHES,
+  batchById, regionsForBatch,
+} = require('./crawl-regions');
+const { normalizeCrawlMode, normalizePublishedDate, shanghaiDate, summarizeTasks, taskState } = require('./crawl-mode');
+const { classifyBitableFailure } = require('./bitable-failure');
+const { evaluateSourceHealth, buildCompensationPlan, recoverExpiredCompensations } = require('./source-health');
+const { canonicalizeUrl } = require('./url-utils');
 
 // ─── 目标表字段工具（与 buildWriteFields 的列类型判定同源）──────────────
 const FIELDS_TTL_MS = 5 * 60 * 1000;
@@ -29,9 +37,19 @@ const _fieldsCache = new Map(); // tableId -> { at: number, fields: [] }
 async function getFieldsCached(bitable, appToken, tableId) {
   const hit = _fieldsCache.get(tableId);
   if (hit && Date.now() - hit.at < FIELDS_TTL_MS) return hit.fields;
-  const fields = await bitable.listFields(appToken, tableId);
-  _fieldsCache.set(tableId, { at: Date.now(), fields });
-  return fields;
+  try {
+    const fields = await bitable.listFields(appToken, tableId);
+    _fieldsCache.set(tableId, { at: Date.now(), fields });
+    return fields;
+  } catch (err) {
+    // 飞书瞬时网络故障时优先使用最近一次成功字段缓存，避免整条预览不可用。
+    if (hit && Array.isArray(hit.fields) && hit.fields.length) {
+      console.warn(`[crawl-api] listFields failed for ${tableId}; using stale cache: ${err.message || err}`);
+      return hit.fields;
+    }
+    err.code = err.code || 'TABLE_FIELDS_UNAVAILABLE';
+    throw err;
+  }
 }
 
 function colKind(f) {
@@ -101,20 +119,45 @@ function normalizeUpdates(fields, updates) {
 const { execFile } = require('child_process');
 const pathMod = require('path');
 const SWEEP_SCRIPT = pathMod.join(__dirname, '..', '..', 'scripts', 'sweep-crawl.js');
+const SOURCE_PROBE_SCRIPT = pathMod.join(__dirname, '..', '..', 'scripts', 'source-probe.js');
+const { getSweepLockStatus, requestSweepStop, inspectSweepProcess } = require('./sweep-lock');
 const _matrixRuns = new Map(); // runId -> { id, state, log[], result, startedAt, endedAt }
 const MATRIX_LOG_KEEP = 200;
+const MATRIX_RUN_TIMEOUT_MS = Math.max(60_000, parseInt(process.env.MATRIX_RUN_TIMEOUT_MS || String(20 * 60 * 1000), 10) || 20 * 60 * 1000);
+
+function terminateProcessTree(childOrPid) {
+  const pid = Number(typeof childOrPid === 'object' ? childOrPid?.pid : childOrPid);
+  if (!pid) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    if (process.platform === 'win32') {
+      const { execFile: execFileKill } = require('child_process');
+      execFileKill('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide:true }, () => resolve(true));
+      return;
+    }
+    try { process.kill(pid, 'SIGTERM'); } catch (_) {}
+    const hard = setTimeout(() => { try { process.kill(pid, 'SIGKILL'); } catch (_) {} resolve(true); }, 2500);
+    hard.unref?.();
+    setTimeout(() => {
+      if (!require('./sweep-lock').pidAlive(pid)) { clearTimeout(hard); resolve(true); }
+    }, 300).unref?.();
+  });
+}
 
 /** 启动一次矩阵巡检子进程。调用方需保证同一时间只有一个 running（db.json 整文件写盘的竞争约束）。 */
-function spawnMatrixRun({ limit = 15, region = '', category = '', all = false } = {}) {
+function spawnMatrixRun({ limit = 15, region = '', regions = [], batch = 'all', category = '', all = false, deep = false, owner = '', compensationMode = '', lookbackDays = 0, mode = 'daily' } = {}) {
   const runId = db.uid('mx');
-  const entry = { id: runId, state: 'running', log: [], result: null, startedAt: db.nowIso(), endedAt: '' };
+  const entry = { id: runId, state: 'running', batch, mode:normalizeCrawlMode(mode), regions, region, category, log: [], result: null, startedAt: db.nowIso(), endedAt: '', userStopped:false };
   const args = [SWEEP_SCRIPT, 'run'];
   if (all) args.push('--all');
   else {
     args.push('--limit', String(limit));
     if (region) args.push('--region', region);
+    else if (regions.length) args.push('--regions', regions.join(','));
     if (category) args.push('--category', category);
+    if (compensationMode) args.push('--compensation-mode', String(compensationMode));
+    if (lookbackDays) args.push('--lookback-days', String(lookbackDays));
   }
+  args.push('--mode', normalizeCrawlMode(mode));
   const push = (chunk) => {
     const lines = String(chunk || '')
       .split('\n')
@@ -123,27 +166,77 @@ function spawnMatrixRun({ limit = 15, region = '', category = '', all = false } 
     entry.log.push(...lines);
     if (entry.log.length > MATRIX_LOG_KEEP) entry.log = entry.log.slice(-MATRIX_LOG_KEEP);
   };
+  const childEnv = { ...process.env };
+  // 手动全量巡检优先跑“轻量基线”：官方枚举 + 基础搜索，不为每个 0 命中格子再调用 AI。
+  // 真正异常省会进入 compensation/recheck，再用 deep 模式补抓，整体更快也更不容易卡住。
+  childEnv.SWEEP_OWNER = owner || (deep ? 'manual-deep' : 'manual');
+  if (all || Number(limit) > 30) childEnv.SWEEP_AI_FALLBACK = 'false';
+  if (deep) {
+    childEnv.CRAWL_SEARCH_DEPTH = 'deep';
+    childEnv.SWEEP_AI_FALLBACK = 'true';
+  }
   const child = execFile(
     process.execPath,
     args,
-    { cwd: pathMod.join(__dirname, '..', '..'), timeout: 0, maxBuffer: 32 * 1024 * 1024 },
+    { cwd: pathMod.join(__dirname, '..', '..'), env:childEnv, timeout: MATRIX_RUN_TIMEOUT_MS, killSignal: 'SIGTERM', windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
     (err, stdout, stderr) => {
       // 子进程整文件落盘后，丢弃本进程旧快照重读，避免下次 save 覆盖子进程写入
       try { db.reload(); } catch (_) {}
       entry.endedAt = db.nowIso();
       const marker = String(stdout || '').lastIndexOf('__RESULT__');
-      if (marker !== -1) {
+      if (entry.userStopped) {
+        entry.state = 'killed';
+        entry.result = { ok:false, killed:true, error:'用户手动终止' };
+      } else if (marker !== -1) {
         try {
           entry.result = JSON.parse(String(stdout).slice(marker + '__RESULT__'.length));
-          entry.state = 'done';
+          entry.state = entry.result?.stopped ? 'killed' : 'done';
         } catch (_) {
           entry.result = { ok: false, error: '巡检结果 JSON 解析失败' };
           entry.state = 'error';
         }
       } else {
         entry.state = err ? 'error' : 'done';
-        entry.result = { ok: !err, error: err ? err.message : '子进程未返回结果标记' };
+        const timedOut = !!(err && (err.killed || err.signal) && /timed out|timeout|SIGTERM/i.test(String(err.message || '') + String(err.signal || '')));
+        entry.result = { ok: !err, timeout: timedOut, error: err ? (timedOut ? `巡检超过 ${Math.round(MATRIX_RUN_TIMEOUT_MS/60000)} 分钟已终止` : err.message) : '子进程未返回结果标记' };
       }
+      // 强制终止可能发生在任务刚标记 running、尚未来得及自行回写时。
+      // 单飞锁保证此处无第二个 sweep，只回收本次范围，避免后台残留假“运行中”。
+      if (entry.state === 'killed' || entry.state === 'error' || !entry.result?.ok) {
+        try {
+          const d = db.getDb();
+          const scope = new Set(entry.region ? [entry.region] : (entry.regions || []));
+          let recovered = 0;
+          for (const task of d.crawlTasks || []) {
+            if (task.status !== 'running') continue;
+            if (scope.size && !scope.has(task.region)) continue;
+            if (entry.category && !String(task.keyword || '').includes(entry.category)) continue;
+            task.status = 'todo';
+            task.error = entry.userStopped ? '' : (entry.result?.error || task.error || '巡检异常退出');
+            recovered += 1;
+          }
+          if (recovered) db.save();
+        } catch (_) {}
+      }
+      // 如果这次 run 来自 compensationQueue，完成后更新任务状态/退避时间。
+      try {
+        const d = db.getDb();
+        const cq = (d.compensationQueue || []).find((q) => q.runId === runId && q.status === 'running');
+        if (cq) {
+          const health = (d.sourceHealth || []).find((h) => h.region === cq.region);
+          if (entry.result && entry.result.ok && health && health.status === 'healthy') {
+            cq.status = 'done'; cq.resolvedAt = db.nowIso();
+          } else if ((cq.attempts || 0) >= 5) {
+            cq.status = 'manual'; cq.lastError = entry.result?.error || health?.reason || '多次补偿未恢复';
+          } else {
+            cq.status = 'retry';
+            cq.lastError = entry.result?.error || health?.reason || '';
+            const backoffHours = Math.min(24, 2 ** Math.min(cq.attempts || 1, 5));
+            cq.nextRunAt = new Date(Date.now() + backoffHours * 3600000).toISOString();
+          }
+          db.save();
+        }
+      } catch (_) {}
       _matrixRuns.set(runId, entry);
       if (stderr) console.error(`[matrix-run ${runId}] stderr: ${String(stderr).slice(0, 500)}`);
     },
@@ -158,6 +251,97 @@ function spawnMatrixRun({ limit = 15, region = '', category = '', all = false } 
   }
   console.log(`[matrix-run ${runId}] 启动: node scripts/sweep-crawl.js ${args.join(' ')}`);
   return runId;
+}
+
+function runSourceProbe(region) {
+  return new Promise((resolve) => {
+    execFile(
+      process.execPath,
+      [SOURCE_PROBE_SCRIPT, '--region', region, '--max-pages', '1'],
+      {
+        cwd:pathMod.join(__dirname, '..', '..'),
+        timeout:75_000,
+        killSignal:'SIGTERM',
+        windowsHide:true,
+        maxBuffer:2 * 1024 * 1024,
+        env:{ ...process.env, ENUM_HTTP_TIMEOUT_MS: process.env.ENUM_HTTP_TIMEOUT_MS || '6000' },
+      },
+      (err, stdout, stderr) => {
+        const text=String(stdout || '');
+        const m=text.lastIndexOf('__RESULT__');
+        let result=null;
+        if (m !== -1) {
+          try { result=JSON.parse(text.slice(m + '__RESULT__'.length)); } catch (_) {}
+        }
+        if (!result) result={ ok:false, error:err?.message || String(stderr || '来源探测失败').slice(0,300) };
+        resolve(result);
+      },
+    );
+  });
+}
+
+function saveSourceProbeResult(region, result) {
+  const d = db.getDb();
+  if (!Array.isArray(d.sourceHealth)) d.sourceHealth = [];
+  if (!Array.isArray(d.compensationQueue)) d.compensationQueue = [];
+  const province = PROVINCES.find((p) => p.key === region);
+  if (!province) return;
+  let row = d.sourceHealth.find((x) => x.region === region);
+  if (!row) {
+    row = { id:province.key, region, province:province.name, root:province.root, consecutiveZeroNewRuns:0, failedRuns24h:0 };
+    d.sourceHealth.push(row);
+  }
+  const now = db.nowIso();
+  const diagnostics = Array.isArray(result?.diagnostics) ? result.diagnostics : [];
+  row.lastRunAt = now;
+  row.endpoints = diagnostics.map((x) => ({
+    kind:`official_${x.type || 'channel'}`,
+    label:x.label || '官方来源',
+    url:(x.urls || [])[0] || '',
+    urls:x.urls || [],
+    lastHttpOk:!!x.ok,
+    lastCheckedAt:now,
+    itemCount:x.itemCount || 0,
+    failed:x.failed || 0,
+    lastError:x.lastError || '',
+    errors:x.errors || [],
+  }));
+  if (!row.endpoints.length && result?.ok === false) {
+    row.endpoints.push({
+      kind:'official_probe', label:'来源探测进程', url:province.root || '', lastHttpOk:false,
+      lastCheckedAt:now, itemCount:0, failed:1,
+      lastError:String(result.error || '来源探测失败').slice(0, 500), errors:[],
+    });
+  }
+  const failed = row.endpoints.filter((x) => !x.lastHttpOk);
+  row.lastError = failed.map((x) => x.lastError).filter(Boolean).slice(-2).join('；').slice(0, 500);
+  row.failedRuns24h = failed.length ? (row.failedRuns24h || 0) + 1 : 0;
+  row.enumItems = Number(result?.itemCount || 0);
+  const latest = (result?.samples || []).map((x) => String(x.publishDate || x.releaseDate || '').slice(0, 10)).filter((x) => /^20\d{2}-\d{2}(?:-\d{2})?$/.test(x)).sort().pop();
+  if (latest) row.latestPrimaryPublishedAt = latest;
+  const health = evaluateSourceHealth({ id:province.key, key:province.key, expectedUpdateDays:7 }, row);
+  row.status = health.status;
+  row.reason = health.reason;
+  if (health.status === 'healthy') {
+    for (const q of d.compensationQueue) {
+      if (q.region === region && ['queued','retry'].includes(q.status)) { q.status='done'; q.resolvedAt=now; }
+    }
+  } else {
+    for (const plan of buildCompensationPlan(province, health)) {
+      if (!d.compensationQueue.some((q) => q.region === region && q.mode === plan.mode && ['queued','retry','running'].includes(q.status))) {
+        d.compensationQueue.push({ id:db.uid('cmp'), ...plan, region, status:'queued', attempts:0, createdAt:now, nextRunAt:now });
+      }
+    }
+  }
+  db.save();
+}
+
+function runningSweepInfo() {
+  const local = [..._matrixRuns.values()].find((r) => ['running','stopping'].includes(r.state));
+  if (local) return { busy:true, source:'api', id:local.id, state:local.state, pid:local.child?.pid || 0, startedAt:local.startedAt };
+  const external = getSweepLockStatus();
+  if (external.locked) return { busy:true, source:'external', state:'running', ...external.lock };
+  return { busy:false, state:'idle' };
 }
 
 // ─── 类别对齐：文本 → POLICY_SOURCES 10 类 ────────────────────────────
@@ -325,6 +509,9 @@ function registerCrawlRoutes(app, ctx) {
 
   // 读取兜底：任何入池条目缺 id 自动补（枚举/爬虫个别路径漏设时，预览/入库/忽略仍可定位）
   const crawlList = () => {
+    // 巡检子进程每爬完一格就落盘一次，这里同步后再读，待审批列表才能随入池实时增长
+    // （否则要等整轮结束子进程退出、触发 reload 才更新）
+    db.syncIfChanged();
     const q = db.getDb().crawlQueue;
     let dirty = false;
     for (const c of q) {
@@ -338,14 +525,32 @@ function registerCrawlRoutes(app, ctx) {
   // 响应形状 1:1 对齐原版 shared/api.interface.ts 的 ICrawlResult：
   // 前端 BitableDisplayPage 依赖 comparisonResult / bitableRecordId / province / city /
   // summary / officialUrl / policyDomain / amount / effectiveDate 等字段渲染与按钮 gating。
-  app.get('/api/crawl/crawled-pending', async (req, res, next) => {
+  app.get('/api/crawl/crawled-pending', requireUser, async (req, res, next) => {
     try {
-      const all = await store.getAll();
-      const stats = { new: 0, exists: 0, needs_update: 0, suspect: 0 };
+      let all = [];
+      let comparisonAvailable = true;
+      let comparisonError = '';
+      const compareTimeoutMs = Math.max(2000, parseInt(process.env.ADMIN_COMPARE_TIMEOUT_MS || '8000', 10) || 8000);
+      try {
+        all = await Promise.race([
+          store.getAll(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error(`飞书存量比对超过 ${compareTimeoutMs}ms`)), compareTimeoutMs)),
+        ]);
+      } catch (e) {
+        comparisonAvailable = false;
+        comparisonError = String(e.message || e).slice(0, 300);
+        console.warn('[crawl] 审批列表飞书比对暂不可用，先返回本地队列:', comparisonError);
+      }
+      const selectedRegions = new Set(regionsForBatch(req.query.batch || 'all'));
+      const listMode = normalizeCrawlMode(req.query.mode);
+      const today = shanghaiDate();
+      const stats = { new: 0, exists: 0, needs_update: 0, suspect: 0, unknown: 0 };
       const items = crawlList()
         .filter((c) => !['confirmed', 'pending_sync', 'ignored'].includes(c.status))
+        .filter((c) => selectedRegions.has(c.region || '全国'))
+        .filter((c) => listMode === 'initial' || normalizePublishedDate(c.releaseDate || c.publishDate) === today)
         .map((c) => {
-          const st = matchStatus(c, all);
+          const st = comparisonAvailable ? matchStatus(c, all) : 'unknown';
           stats[st] += 1;
           // quality：新记录已带标记；存量（无标记）实时补算一次，不落库
           let quality = c.quality;
@@ -395,9 +600,12 @@ function registerCrawlRoutes(app, ctx) {
             validity: '现行有效',
             quality,
             qualityReasons,
+            createdAt: c.createdAt || '',
+            // 今日**入池**（爬到的时间），与"今日发布(todayAdded)"是两个口径，勿混用
+            addedToday: shanghaiDate(c.createdAt) === today,
           };
         });
-      res.json({ items, total: items.length, stats });
+      res.json({ items, total: items.length, mode:listMode, stats, comparisonAvailable, comparisonError });
     } catch (err) {
       next(err);
     }
@@ -429,43 +637,248 @@ function registerCrawlRoutes(app, ctx) {
 
   // GET /api/crawl/matrix-status → 矩阵巡检任务队列概览（审批台「一键巡检」区渲染）
   app.get('/api/crawl/matrix-status', requireUser, (req, res) => {
-    const tasks = db.getDb().crawlTasks || [];
-    const done = tasks.filter((t) => t.status === 'done').length;
-    const errs = tasks.filter((t) => t.status === 'error');
-    const queue = db.getDb().crawlQueue || [];
-    const running = [..._matrixRuns.values()].filter((r) => r.state === 'running');
+    // 同步子进程写入：巡检进度、每格命中数、待确认池计数都要实时反映
+    db.syncIfChanged();
+    const batch = batchById(req.query.batch || 'all');
+    const selectedRegions = new Set(batch.regions);
+    const tasks = (db.getDb().crawlTasks || []).filter((t) => selectedRegions.has(t.region));
+    const summary = summarizeTasks(tasks);
+    const errs = tasks.filter((t) => taskState(t.status) === 'failed');
+    const queue = (db.getDb().crawlQueue || []).filter((c) => selectedRegions.has(c.region || '全国'));
+    const running = [..._matrixRuns.values()].filter((r) => ['running','stopping'].includes(r.state));
+    const activeSweep = runningSweepInfo();
+    const today = shanghaiDate();
+    const pendingQueue = queue.filter((c) => !['confirmed', 'pending_sync', 'ignored'].includes(c.status));
+    const pipeline = tasks.reduce((out, task) => {
+      for (const key of Object.keys(out)) out[key] += Number(task.pipeline?.[key] || 0);
+      return out;
+    }, { discovered:0, dateFiltered:0, qualityFiltered:0, duplicates:0, accepted:0 });
     res.json({
-      total: tasks.length,
-      done,
-      error: errs.length,
-      remaining: tasks.length - done,
+      batch: { id:batch.id, label:batch.label, regions:batch.regions },
+      batches: REGION_BATCHES.map((x) => ({ id:x.id, label:x.label, regionCount:x.regions.length, total:x.regions.length * MATRIX_CATEGORY_KEYWORDS.length })),
+      total: summary.total,
+      runningCount: summary.running,
+      done: summary.done,
+      error: summary.failed,
+      failed: summary.failed,
+      remaining: summary.pending,
+      paused: summary.paused,
       recentErrors: errs.slice(-5).map((t) => ({ id: t.id, error: t.error, lastRun: t.lastRun })),
       queue: {
-        pending: queue.filter((c) => c.status !== 'confirmed' && c.status !== 'pending_sync').length,
+        pending: pendingQueue.length,
+        // 「今日新增」= 今日**发布**的政策，与"今日增量"巡检模式同一口径（按发布日期）。
+        // 注意：不是"今日入池"。政策可能今天才被爬到，但发布日期是历史的，
+        // 这种情况不计入今日新增——这是正确语义，勿改成按 createdAt 统计。
+        // 想看"今天刚爬进来"的条目，用接口里的 addedToday 字段 / 列表 NEW 徽标。
+        todayAdded: pendingQueue.filter((c) => normalizePublishedDate(c.releaseDate || c.publishDate) === today).length,
         total: queue.length,
       },
       outboxPending: (db.getDb().syncOutbox || []).filter((o) => !o.synced).length,
       llmEnabled: llm.llmEnabled(),
       running: running.map((r) => r.id),
+      activeSweep,
+      sweepLock: getSweepLockStatus(),
+      regions: REGIONS,
+      matrixKeywords: MATRIX_CATEGORY_KEYWORDS,
+      tasks: tasks.map((t) => ({ ...t, state:taskState(t.status), pipeline:t.pipeline || { discovered:Number(t.hits)||0, dateFiltered:0, qualityFiltered:0, duplicates:Math.max(0,(Number(t.hits)||0)-(Number(t.added)||0)), accepted:Number(t.added)||0 } })),
+      pipeline,
+      sourceHealth: (Array.isArray(db.getDb().sourceHealth) ? db.getDb().sourceHealth : []).filter((h) => selectedRegions.has(h.region)),
+      compensationPending: (db.getDb().compensationQueue || []).filter((q) => ['queued','retry','running'].includes(q.status)).length,
     });
+  });
+
+  app.patch('/api/crawl/tasks/:id', requireUser, (req, res) => {
+    const task = (db.getDb().crawlTasks || []).find((x) => x.id === req.params.id);
+    if (!task) return res.status(404).json({ statusCode:404, message:'巡检任务不存在', error:'Not Found' });
+    const action = String(req.body?.action || '').trim();
+    if (action === 'pause') {
+      if (task.status === 'running') return res.status(409).json({ statusCode:409, message:'运行中的任务请先停止整轮巡检', error:'Conflict' });
+      task.status = 'paused';
+    } else if (action === 'resume') {
+      if (task.status === 'paused') task.status = 'todo';
+    } else if (action && action !== 'priority') {
+      return res.status(400).json({ statusCode:400, message:'action 仅支持 pause/resume/priority', error:'Bad Request' });
+    }
+    if (req.body?.priority !== undefined) {
+      const priority = Number(req.body.priority);
+      if (!Number.isFinite(priority)) return res.status(400).json({ statusCode:400, message:'priority 必须是数字', error:'Bad Request' });
+      task.priority = Math.max(0, Math.min(100, Math.round(priority)));
+    }
+    db.save();
+    res.json({ success:true, task:{ ...task, state:taskState(task.status) } });
+  });
+
+  app.patch('/api/crawl/candidates/:id', requireUser, (req, res) => {
+    const item = crawlList().find((x) => x.id === req.params.id);
+    if (!item) return res.status(404).json({ statusCode:404, message:'候选政策不存在', error:'Not Found' });
+    if (['confirmed','pending_sync','ignored'].includes(item.status)) return res.status(409).json({ statusCode:409, message:'该候选已处理，不能再修改', error:'Conflict' });
+    const allowed = ['title','region','category','releaseDate','effectiveDate','expirationDate','summary','note'];
+    const changes = {};
+    for (const key of allowed) if (Object.prototype.hasOwnProperty.call(req.body || {}, key)) changes[key] = String(req.body[key] ?? '').trim();
+    if ('title' in changes && !changes.title) return res.status(400).json({ statusCode:400, message:'标题不能为空', error:'Bad Request' });
+    if ('region' in changes && !REGIONS.includes(changes.region)) return res.status(400).json({ statusCode:400, message:'地区无效', error:'Bad Request' });
+    if ('category' in changes && !POLICY_SOURCES.some((x) => x.category === changes.category)) return res.status(400).json({ statusCode:400, message:'政策分类无效', error:'Bad Request' });
+    for (const key of ['releaseDate','effectiveDate','expirationDate']) {
+      if (changes[key] && !/^20\d{2}-\d{2}-\d{2}$/.test(changes[key])) return res.status(400).json({ statusCode:400, message:`${key} 必须为 YYYY-MM-DD`, error:'Bad Request' });
+    }
+    Object.assign(item, changes, { editedAt:db.nowIso(), editedBy:req.user?.name || req.user?.sub || 'admin' });
+    db.save();
+    res.json({ success:true, item });
+  });
+
+  function healthAction(h, activeComp) {
+    const status = h.status || 'unknown';
+    const reason = h.reason || 'not_checked';
+    if (activeComp) return `自动补偿${activeComp.status === 'running' ? '正在执行' : '已排队'}：${activeComp.mode}`;
+    if (status === 'unknown') return '先点“探测源”，确认固定入口和自动发现是否可用';
+    if (status === 'down' || reason === 'no_successful_endpoint') return '先探测源；固定入口失效则修 URL，保留自动发现兜底';
+    if (reason === 'secondary_newer_than_primary') return '主栏目疑似漏抓：执行深度复检/分页回溯';
+    if (reason === 'abnormal_zero_updates') return '连续零新增：执行深度复检，并检查公报/规范性文件库';
+    if (reason === 'primary_content_stale' || status === 'stale') return '来源疑似停更：重新发现政策入口并回溯近期分页';
+    if (reason === 'partial_endpoint_failure' || status === 'degraded') return '部分入口失败：探测源并只修失败入口';
+    if (status === 'suspicious') return '执行深度复检，比较搜索与官方栏目最新日期';
+    return '无需人工处理';
+  }
+
+  // GET /api/crawl/source-health → 31 省来源健康、异常原因与补偿任务
+  app.get('/api/crawl/source-health', requireUser, (req, res) => {
+    const d = db.getDb();
+    const health = Array.isArray(d.sourceHealth) ? d.sourceHealth : [];
+    const queue = Array.isArray(d.compensationQueue) ? d.compensationQueue : [];
+    const batch = batchById(req.query.batch || 'all');
+    const regionSet = new Set(batch.regions);
+    const selectedProvinces = PROVINCES.filter((p) => regionSet.has(p.key));
+    const by = { healthy:0, degraded:0, stale:0, suspicious:0, down:0, unknown:0 };
+    for (const p of selectedProvinces) {
+      const h = health.find((x) => x.region === p.key);
+      by[h?.status || 'unknown'] = (by[h?.status || 'unknown'] || 0) + 1;
+    }
+    const nationalTasks = (d.crawlTasks || []).filter((t) => t.region === '全国');
+    const nationalSummary = summarizeTasks(nationalTasks);
+    const nationalItem = regionSet.has('全国') ? {
+      region:'全国', province:'全国专项', root:'https://www.gov.cn/zhengce/',
+      status:nationalSummary.failed ? 'degraded' : (nationalSummary.done ? 'healthy' : 'unknown'),
+      reason:nationalSummary.failed ? 'search_task_failure' : (nationalSummary.done ? 'ok' : 'not_checked'),
+      action:nationalSummary.failed ? '查看失败关键词并重新运行全国专项' : (nationalSummary.done ? '无需人工处理' : '运行全国专项完成首次验证'),
+      needsAction:!nationalSummary.done || !!nationalSummary.failed,
+      lastRunAt:nationalTasks.map((t)=>t.lastRun || '').sort().at(-1) || '',
+      lastHits:nationalTasks.reduce((n,t)=>n+(Number(t.hits)||0),0), lastAdded:nationalTasks.reduce((n,t)=>n+(Number(t.added)||0),0),
+      enumItems:0, searchItems:nationalTasks.reduce((n,t)=>n+(Number(t.hits)||0),0), failedRuns24h:nationalSummary.failed,
+      lastError:nationalTasks.find((t)=>taskState(t.status)==='failed')?.error || '', endpoints:[], badEndpoints:[], compensation:null,
+    } : null;
+    if (nationalItem) by[nationalItem.status] = (by[nationalItem.status] || 0) + 1;
+    res.json({
+      summary: by,
+      batch:{ id:batch.id, label:batch.label },
+      totalProvinces: selectedProvinces.length,
+      items: [...(nationalItem ? [nationalItem] : []), ...selectedProvinces.map((p) => {
+        const h = health.find((x) => x.region === p.key) || {};
+        const activeComp = queue.find((q) => q.region === p.key && ['queued','retry','running'].includes(q.status)) || null;
+        const endpoints = Array.isArray(h.endpoints) ? h.endpoints : [];
+        const badEndpoints = endpoints.filter((e) => e.lastHttpOk === false);
+        return {
+          region:p.key, province:p.name, root:p.root,
+          status:h.status || 'unknown', reason:h.reason || 'not_checked',
+          action:healthAction(h, activeComp), needsAction:(h.status || 'unknown') !== 'healthy',
+          lastRunAt:h.lastRunAt || '', lastDiscoveredAt:h.lastDiscoveredAt || '', lastHits:h.lastHits || 0, lastAdded:h.lastAdded || 0,
+          enumItems:h.enumItems || 0, searchItems:h.searchItems || 0, consecutiveZeroNewRuns:h.consecutiveZeroNewRuns || 0,
+          failedRuns24h:h.failedRuns24h || 0, lastError:h.lastError || '', endpoints, badEndpoints,
+          compensation:activeComp ? { id:activeComp.id, mode:activeComp.mode, status:activeComp.status, priority:activeComp.priority || 0, attempts:activeComp.attempts || 0, nextRunAt:activeComp.nextRunAt || '' } : null,
+        };
+      })],
+      compensationQueue: queue.filter((q)=>regionSet.has(q.region)).sort((a,b)=>(b.priority||0)-(a.priority||0)),
+    });
+  });
+
+  // POST /api/crawl/compensation/run-next → 立即执行优先级最高且到期的补偿任务
+  app.post('/api/crawl/compensation/run-next', requireUser, (req, res) => {
+    const running = runningSweepInfo();
+    if (running.busy) return res.status(409).json({ statusCode:409, message:`已有巡检运行中${running.id ? '：' + running.id : ''}`, running, error:'Conflict' });
+    const d = db.getDb();
+    const now = Date.now();
+    const recovered = recoverExpiredCompensations(
+      d.compensationQueue || [],
+      now,
+      process.env.COMPENSATION_LEASE_MS || 30 * 60 * 1000,
+    );
+    if (recovered) db.save();
+    const q = (d.compensationQueue || [])
+      .filter((x) => ['queued','retry'].includes(x.status) && (!x.nextRunAt || Date.parse(x.nextRunAt) <= now))
+      .sort((a,b)=>(b.priority||0)-(a.priority||0) || Date.parse(a.createdAt||0)-Date.parse(b.createdAt||0))[0];
+    if (!q) return res.json({ success:true, empty:true, message:'当前没有到期的补偿任务' });
+    q.status='running'; q.attempts=(q.attempts||0)+1; q.lastRunAt=db.nowIso();
+    db.save();
+    const runId = spawnMatrixRun({
+      limit:MATRIX_CATEGORY_KEYWORDS.length,
+      region:q.region,
+      deep:true,
+      owner:'compensation',
+      compensationMode:q.mode,
+      lookbackDays:q.lookbackDays,
+    });
+    q.runId=runId; db.save();
+    res.json({ success:true, runId, task:q, message:`已启动 ${q.region} 补偿巡检` });
+  });
+
+  // POST /api/crawl/source-probe/:region → 轻量探测官方枚举入口，不跑13类搜索
+  app.post('/api/crawl/source-probe/:region', requireUser, async (req, res, next) => {
+    try {
+      const region=String(req.params.region || '').trim();
+      if (!REGIONS.includes(region) || region === '全国') return res.status(400).json({ statusCode:400, message:'地区无效', error:'Bad Request' });
+      const result=await runSourceProbe(region);
+      saveSourceProbeResult(region, result);
+      res.json(result);
+    } catch (e) { next(e); }
+  });
+
+  // POST /api/crawl/source-health/:region/recheck → 手动整省复检
+  app.post('/api/crawl/source-health/:region/recheck', requireUser, (req, res) => {
+    const region=String(req.params.region||'').trim();
+    if (!REGIONS.includes(region) || region === '全国') return res.status(400).json({ statusCode:400, message:'地区无效', error:'Bad Request' });
+    const running=runningSweepInfo();
+    if (running.busy) return res.status(409).json({ statusCode:409, message:`已有巡检运行中${running.id ? '：' + running.id : ''}`, running, error:'Conflict' });
+    const runId=spawnMatrixRun({ limit:MATRIX_CATEGORY_KEYWORDS.length, region, deep:true });
+    res.json({ success:true, runId, message:`已启动 ${region} 全类别复检` });
   });
 
   // POST /api/crawl/matrix-run {limit?, region?, category?, all?} → 触发一批矩阵巡检（异步子进程）
   app.post('/api/crawl/matrix-run', requireUser, (req, res) => {
-    const running = [..._matrixRuns.values()].find((r) => r.state === 'running');
-    if (running) {
-      return res.status(409).json({ statusCode: 409, message: `已有巡检任务 ${running.id} 运行中，请等待完成后再触发`, error: 'Conflict' });
+    const running = runningSweepInfo();
+    if (running.busy) {
+      return res.status(409).json({ statusCode: 409, message: `已有巡检运行中${running.id ? '：' + running.id : ''}，请等待完成后再触发`, running, error: 'Conflict' });
     }
-    const { limit, region, category, all } = req.body || {};
+    const { limit, region, category, all, batch:batchId='all', mode='daily' } = req.body || {};
+    if (!REGION_BATCHES.some((x) => x.id === String(batchId))) {
+      return res.status(400).json({ statusCode:400, message:'区域批次无效', error:'Bad Request' });
+    }
+    const batch = batchById(batchId);
+    const normalizedRegion = String(region || '').trim();
+    if (normalizedRegion && !REGIONS.includes(normalizedRegion)) {
+      return res.status(400).json({ statusCode:400, message:'地区无效', error:'Bad Request' });
+    }
+    if (normalizedRegion && !batch.regions.includes(normalizedRegion)) {
+      return res.status(400).json({ statusCode:400, message:`${normalizedRegion} 不属于${batch.label}批次`, error:'Bad Request' });
+    }
     let lmt = parseInt(limit, 10);
-    lmt = Number.isFinite(lmt) && lmt > 0 ? Math.min(lmt, 99999) : 15;
+    if (Number.isFinite(lmt) && lmt > 0) {
+      lmt = Math.min(lmt, 99999);
+    } else if (normalizedRegion && String(category || '').trim()) {
+      lmt = 1;
+    } else if (normalizedRegion) {
+      lmt = MATRIX_CATEGORY_KEYWORDS.length;
+    } else {
+      lmt = all ? batch.regions.length * MATRIX_CATEGORY_KEYWORDS.length : 15;
+    }
     const runId = spawnMatrixRun({
       limit: lmt,
-      region: String(region || '').trim(),
+      region: normalizedRegion,
+      regions: normalizedRegion ? [] : batch.regions,
+      batch: batch.id,
       category: String(category || '').trim(),
-      all: !!all,
+      all: !!all && batch.id === 'all' && !normalizedRegion,
+      mode: normalizeCrawlMode(mode),
     });
-    res.json({ success: true, runId, message: '矩阵巡检已启动（独立子进程，完成后自动并入待确认池）' });
+    res.json({ success: true, runId, batch:{ id:batch.id, label:batch.label }, mode:normalizeCrawlMode(mode), message: `${batch.label}巡检已启动（${normalizeCrawlMode(mode)==='daily'?'今日增量':'初始化补全'}）` });
   });
 
   // GET /api/crawl/matrix-run/:id → 轮询巡检任务状态/日志/结果
@@ -477,6 +890,11 @@ function registerCrawlRoutes(app, ctx) {
       state: run.state,
       log: run.log.slice(-120),
       result: run.result,
+      batch: run.batch,
+      mode: run.mode,
+      regions: run.regions,
+      region: run.region,
+      category: run.category,
       startedAt: run.startedAt,
       endedAt: run.endedAt,
     });
@@ -492,12 +910,40 @@ function registerCrawlRoutes(app, ctx) {
     if (!run.child || !run.child.kill) {
       return res.status(500).json({ statusCode: 500, message: '子进程引用丢失，无法停止', error: 'Internal Error' });
     }
-    run.child.kill('SIGTERM');
-    run.state = 'killed';
-    run.endedAt = db.nowIso();
-    run.result = { ok: false, error: '用户手动终止' };
-    console.log(`[matrix-run ${run.id}] 用户手动终止`);
-    res.json({ success: true, message: '巡检已停止' });
+    run.userStopped = true;
+    run.state = 'stopping';
+    requestSweepStop({ pid:run.child.pid, requestedBy:'matrix-api', reason:'manual_stop' });
+    terminateProcessTree(run.child).catch(() => {});
+    console.log(`[matrix-run ${run.id}] 用户请求终止 pid=${run.child.pid}`);
+    res.json({ success: true, stopping:true, message: '停止请求已发送，正在结束当前巡检' });
+  });
+
+  // POST /api/crawl/sweep-stop → 停止任意当前巡检（包括 cron/补偿/页面刷新后丢失 runId 的任务）
+  app.post('/api/crawl/sweep-stop', requireUser, (req, res) => {
+    const local = [..._matrixRuns.values()].find((r) => ['running','stopping'].includes(r.state));
+    if (local?.child?.pid) {
+      local.userStopped = true;
+      local.state = 'stopping';
+      requestSweepStop({ pid:local.child.pid, requestedBy:'global-stop', reason:'manual_stop' });
+      terminateProcessTree(local.child).catch(() => {});
+      return res.json({ success:true, stopping:true, runId:local.id, pid:local.child.pid, message:'正在停止当前巡检' });
+    }
+    const lock = getSweepLockStatus();
+    if (!lock.locked || !lock.lock?.pid) return res.json({ success:true, empty:true, message:'当前没有运行中的巡检' });
+    requestSweepStop({ pid:lock.lock.pid, requestedBy:'global-stop', reason:'manual_stop' });
+    const identity = inspectSweepProcess(lock.lock);
+    if (!identity.ok) {
+      return res.status(409).json({
+        statusCode:409,
+        success:false,
+        stopping:false,
+        message:'已写入停止请求，但锁对应进程身份无法确认，已拒绝强制结束，避免误杀其他程序',
+        reason:identity.reason,
+        error:'Conflict',
+      });
+    }
+    terminateProcessTree(lock.lock.pid).catch(() => {});
+    res.json({ success:true, stopping:true, pid:lock.lock.pid, message:'正在停止外部巡检进程' });
   });
 
   // POST /api/crawl/table-preview {recordId} → 目标表「整行预览」：每列当前将写入值 +
@@ -524,7 +970,13 @@ function registerCrawlRoutes(app, ctx) {
           ...(src.dateFields || []).map((n) => ({ name: n, kind: 'date' })),
         ];
         if (cols.length) {
-          const suggs = await llm.suggestTableValues(`${item.title || ''}\n${(item.content || '').slice(0, 2500)}`, cols);
+          let suggs = [];
+          try {
+            suggs = await llm.suggestTableValues(`${item.title || ''}\n${(item.content || '').slice(0, 2500)}`, cols);
+          } catch (err) {
+            // 预览不能依赖 LLM 可用性；AI 挂掉时继续展示本地规则可生成的字段。
+            console.warn(`[crawl-api] preview LLM degraded for ${recordId}: ${err.message || err}`);
+          }
           if (suggs.length) {
             item.valuesSuggest = suggs;
             const vmap = {};
@@ -702,6 +1154,12 @@ function registerCrawlRoutes(app, ctx) {
       const { recordId } = req.body || {};
       const item = crawlList().find((c) => c.id === recordId);
       if (!item) return res.status(404).json({ statusCode: 404, message: '采集条目不存在', error: 'Not Found' });
+      if (item.status === 'confirmed') {
+        return res.json({ success:true, alreadyConfirmed:true, category:item.targetCategory || item.category || '', targetTableId:item.targetTableId || '', message:'该条目已入库，无需重复写入' });
+      }
+      if (item.status === 'pending_sync') {
+        return res.json({ success:true, pendingSync:true, outboxId:item.outboxId || '', category:item.targetCategory || item.category || '', targetTableId:item.targetTableId || '', message:'该条目已在待同步队列中，无需重复提交' });
+      }
       const category =
         (item.category && POLICY_SOURCES.some((s) => s.category === item.category) ? item.category : '') ||
         classifyCategory(`${item.title}${item.content}${item.region}`);
@@ -713,7 +1171,25 @@ function registerCrawlRoutes(app, ctx) {
           error: 'Bad Request',
         });
       }
-      const targetFields = await bitable.listFields(src.appToken, src.tableId);
+      const enqueueRetry = (fields, failure, updates) => {
+        const outboxItem = { id:db.uid('sync'), kind:fields ? 'create' : 'crawl_create', appToken:src.appToken, tableId:src.tableId,
+          ...(fields ? { fields } : { updates:updates || {} }), sourceItemId:item.id, category, synced:false,
+          createdAt:db.nowIso(), lastError:failure.message, failureKind:failure.kind };
+        db.getDb().syncOutbox.push(outboxItem);
+        Object.assign(item, { status:'pending_sync', targetCategory:category, targetTableId:src.tableId, outboxId:outboxItem.id, lastError:failure.message });
+        db.save();
+        return res.status(201).json({ success:true, category, targetTableId:src.tableId, pendingSync:true, outboxId:outboxItem.id,
+          degradeReason:failure.kind, message:`飞书暂时不可用，已安全保存到待同步队列：${failure.message}` });
+      };
+      let targetFields;
+      try {
+        targetFields = await getFieldsCached(bitable, src.appToken, src.tableId);
+      } catch (err) {
+        const failure = classifyBitableFailure(err);
+        if (failure.retryable) return enqueueRetry(null, failure, (req.body || {}).updates);
+        return res.status(422).json({ success:false, pendingSync:false, statusCode:422,
+          message:`无法读取目标表字段，且该错误不会自动重试：${failure.message}`, error:'Bitable fields unavailable' });
+      }
       const fields = buildWriteFields(targetFields, item);
       // 用户改过的单元格（updates: {目标表列名: 值}）规范化后覆盖默认映射，实现「整行写入」
       const overrides = normalizeUpdates(targetFields, (req.body || {}).updates);
@@ -738,37 +1214,10 @@ function registerCrawlRoutes(app, ctx) {
           created: result.created,
         });
       } catch (err) {
-        // 无写权限（403 等）→ 降级进本地待同步队列，权限开通后 POST /api/bitable/sync-out 补推
-        const isPermission = /403|Forbidden|无权限|91403/.test(err.message);
-        const outboxItem = {
-          id: db.uid('sync'),
-          kind: 'create',
-          appToken: src.appToken,
-          tableId: src.tableId,
-          fields,
-          sourceItemId: item.id,
-          category,
-          synced: false,
-          createdAt: db.nowIso(),
-          lastError: err.message,
-        };
-        db.getDb().syncOutbox.push(outboxItem);
-        item.status = 'pending_sync';
-        item.targetCategory = category;
-        item.targetTableId = src.tableId;
-        item.outboxId = outboxItem.id;
-        item.lastError = err.message;
-        db.save();
-        res.status(201).json({
-          success: true,
-          category,
-          targetTableId: src.tableId,
-          pendingSync: true,
-          outboxId: outboxItem.id,
-          message: isPermission
-            ? `已加入本地待同步队列（当前凭证对「${category}」表无写权限）。开通表格写权限后调 POST /api/bitable/sync-out 即可真实写入。`
-            : `写入失败，已暂存本地待同步队列：${err.message}`,
-        });
+        const failure = classifyBitableFailure(err);
+        if (failure.retryable) return enqueueRetry(fields, failure);
+        return res.status(422).json({ success:false, pendingSync:false, statusCode:422,
+          message:`飞书拒绝该条数据，未进入待同步队列：${failure.message}`, error:'Bitable validation failed' });
       }
     } catch (err) {
       next(err);
@@ -789,9 +1238,9 @@ function registerCrawlRoutes(app, ctx) {
 
   // POST /api/crawl/compare {keyword, region} → 真爬虫在线采集：搜索发现 → 抓原文 →
   // 10类白名单过滤 → 写入待确认池（url去重）→ 与正式库比对返回 ICrawlResult 结构
-  app.post('/api/crawl/compare', async (req, res, next) => {
+  app.post('/api/crawl/compare', requireUser, async (req, res, next) => {
     try {
-      const { keyword, region } = req.body || {};
+      const { keyword, region, mode='daily' } = req.body || {};
       if (!keyword || !region) {
         return res.status(400).json({ statusCode: 400, message: 'keyword 与 region 必填', error: 'Bad Request' });
       }
@@ -815,11 +1264,16 @@ function registerCrawlRoutes(app, ctx) {
       // 写入待确认池（按 url 去重），页面「第二步·核对并确认入库」可见
       const list = crawlList();
       let added = 0;
+      let dateFiltered = 0;
+      let duplicates = 0;
       for (const item of crawled) {
-        if (!list.some((c) => c.url && c.url === item.url)) {
+        item.url = canonicalizeUrl(item.url);
+        if (!queueDecision(item, mode).accept) { dateFiltered += 1; continue; }
+        if (!list.some((c) => c.url && canonicalizeUrl(c.url) === item.url)) {
+          item.crawlMode = normalizeCrawlMode(mode);
           list.push(item);
           added += 1;
-        }
+        } else duplicates += 1;
       }
       if (added > 0) db.save();
 
@@ -859,7 +1313,7 @@ function registerCrawlRoutes(app, ctx) {
       });
       const stats = { new: 0, exists: 0, needs_update: 0 };
       for (const it of items) stats[it.comparisonResult] += 1;
-      res.json({ items, total: items.length, stats, addedToQueue: added, aiEnabled: !!aiVerdicts });
+      res.json({ items, total: items.length, stats, addedToQueue: added, aiEnabled: !!aiVerdicts, mode:normalizeCrawlMode(mode), pipeline:{ discovered:crawled.length, dateFiltered, qualityFiltered:Number(parsed.qualityFiltered||0), duplicates, accepted:added } });
     } catch (err) {
       next(err);
     }
@@ -869,7 +1323,7 @@ function registerCrawlRoutes(app, ctx) {
   // 用于发现层：基础关键词命中为0时，用 AI 变体词重新搜索，提升新政策发现量
   app.post('/api/crawl/ai-expand', requireUser, async (req, res, next) => {
     try {
-      const { keyword, region, count = 5 } = req.body || {};
+      const { keyword, region, count = 5, mode='daily' } = req.body || {};
       if (!keyword || !region) {
         return res.status(400).json({ statusCode: 400, message: 'keyword 与 region 必填', error: 'Bad Request' });
       }
@@ -879,14 +1333,28 @@ function registerCrawlRoutes(app, ctx) {
       // 2. 若命中为0，用 DeepSeek 生成变体词再搜
       let expandedTerms = [];
       let extraItems = [];
-      if (baseItems.length === 0 && llm.llmEnabled()) {
-        const terms = await llm.aiExpandSearchTerms({ province: region, category: keyword, count }).catch(() => null);
-        if (terms && terms.length > 0) {
-          expandedTerms = terms;
-          for (const term of terms) {
-            const ext = await crawler.crawlPolicies({ keyword: term, region }).catch(() => []);
-            extraItems = extraItems.concat(ext);
+      let aiAttempted = false;
+      let aiSucceeded = false;
+      let degraded = false;
+      let degradeReason = '';
+      if (baseItems.length === 0) {
+        if (llm.llmEnabled()) {
+          aiAttempted = true;
+          const terms = await llm.aiExpandSearchTerms({ province: region, category: keyword, count }).catch(() => null);
+          if (terms && terms.length > 0) {
+            aiSucceeded = true;
+            expandedTerms = terms;
+            for (const term of terms) {
+              const ext = await crawler.crawlPolicies({ keyword: term, region }).catch(() => []);
+              extraItems = extraItems.concat(ext);
+            }
+          } else {
+            degraded = true;
+            degradeReason = 'DeepSeek 请求失败或未返回有效变体词，已降级为基础抓取结果';
           }
+        } else {
+          degraded = true;
+          degradeReason = 'DeepSeek 未配置，已使用基础抓取结果';
         }
       }
       // 3. 合并结果并按 url 去重
@@ -899,11 +1367,16 @@ function registerCrawlRoutes(app, ctx) {
       // 4. 写入待确认池
       const list = crawlList();
       let added = 0;
+      let dateFiltered = 0;
+      let duplicates = 0;
       for (const it of uniqueItems) {
-        if (!list.some((c) => c.url && c.url === it.url)) {
+        it.url = canonicalizeUrl(it.url);
+        if (!queueDecision(it, mode).accept) { dateFiltered += 1; continue; }
+        if (!list.some((c) => c.url && canonicalizeUrl(c.url) === it.url)) {
+          it.crawlMode = normalizeCrawlMode(mode);
           list.push(it);
           added += 1;
-        }
+        } else duplicates += 1;
       }
       if (added > 0) db.save();
       res.json({
@@ -914,6 +1387,13 @@ function registerCrawlRoutes(app, ctx) {
         totalUnique: uniqueItems.length,
         addedToQueue: added,
         aiEnabled: llm.llmEnabled(),
+        aiAttempted,
+        aiSucceeded,
+        degraded,
+        degradeReason,
+        engine: aiSucceeded ? 'deepseek+base-crawler' : 'base-crawler',
+        mode: normalizeCrawlMode(mode),
+        pipeline: { discovered:uniqueItems.length, dateFiltered, qualityFiltered:0, duplicates, accepted:added },
         terms: expandedTerms,
       });
     } catch (err) {
@@ -922,4 +1402,4 @@ function registerCrawlRoutes(app, ctx) {
   });
 }
 
-module.exports = { registerCrawlRoutes, classifyCategory, buildWriteFields, matchStatus };
+module.exports = { registerCrawlRoutes, classifyCategory, buildWriteFields, normalizeUpdates, matchStatus };

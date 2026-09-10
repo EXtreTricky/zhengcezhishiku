@@ -28,6 +28,11 @@ cookiejar.txt
 # ── 临时调试脚本（以下划线开头，常含本地密钥，不入库）──
 scripts/_*.js
 policy-api/scripts/_*.js
+# 项目根目录下的临时启动/自检脚本（_boot-v43.js、_start-v43-*.cmd、_v43-selfcheck.js 等）
+/_*.js
+/_*.cmd
+/_*.ps1
+_v43-*.log
 
 # ── 系统文件 ──
 .DS_Store

@@ -52,6 +52,27 @@ function uid() {
   return 'crw_' + Date.now().toString(36) + '_' + crypto.randomBytes(4).toString('hex');
 }
 
+/** 有界并发版 Promise.allSettled，避免详情抓取 / LLM 同时把事件循环和网络连接打满。 */
+async function allSettledLimit(list, limit, worker) {
+  const arr = Array.from(list || []);
+  const out = new Array(arr.length);
+  let next = 0;
+  const concurrency = Math.max(1, Math.min(arr.length || 1, Number(limit) || 1));
+  async function runner() {
+    while (true) {
+      const i = next++;
+      if (i >= arr.length) return;
+      try {
+        out[i] = { status: 'fulfilled', value: await worker(arr[i], i) };
+      } catch (reason) {
+        out[i] = { status: 'rejected', reason };
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: concurrency }, () => runner()));
+  return out;
+}
+
 /** 带重定向的 GET，返回 { buf, headers, finalUrl, status } */
 function httpGet(url, redirects = 3) {
   return new Promise((resolve, reject) => {
@@ -320,6 +341,13 @@ function inferRegion(text, inputRegion) {
   return '';
 }
 
+function regionKey(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const hit = PROVINCE_MAP.find(([key, full]) => raw.includes(key) || raw === full);
+  return hit ? hit[0] : raw.replace(/(?:壮族|回族|维吾尔)?自治区$|省$|市$/g, '');
+}
+
 /** 判断链接是否像政策原文页（排除列表页/专题页/无关域） */
 function looksLikePolicyPage(url, title) {
   const fullText = (title + ' ' + url).toLowerCase();
@@ -352,21 +380,28 @@ async function discoverBySearch({ keyword, region }) {
   const year = new Date().getFullYear();
   const prevYear = year - 1;
   const regionPart = region === '全国' ? '' : region;
+  const compensationMode=String(process.env.COMPENSATION_MODE||'');
 
-  // 多路搜索计划：提高命中率（DDG 国内超时，改用更多 Bing 变体 + 360 搜索）
-  const searchPlan = [
-    // Bing 搜索策略（10路，覆盖不同表达）
+  // 分层搜索：先跑官方政策库 + 3 路高价值 Bing；结果不足时再扩到 6 路。
+  // 旧版固定 10 路 × AI 变体会把单个矩阵格放大成几十次请求，是 4201 假死的主要来源之一。
+  const primaryPlan = [
     { engine: 'bing', q: `${regionPart} ${keyword} ${year}`.trim() },
-    { engine: 'bing', q: `${keyword} 标准 调整 ${year} site:gov.cn` },
-    { engine: 'bing', q: `${regionPart} ${keyword} 通知印发 ${year}`.trim() },
-    { engine: 'bing', q: `${keyword} ${prevYear}-${year} site:gov.cn` },
-    { engine: 'bing', q: `${regionPart} ${keyword} 公布 ${year}`.trim() },
-    { engine: 'bing', q: `${keyword} 最新文件 site:gov.cn` },
-    { engine: 'bing', q: `site:gov.cn ${keyword} ${regionPart} ${year}`.trim() },
-    { engine: 'bing', q: `${keyword} 施行 ${year}` },
-    { engine: 'bing', q: `${regionPart} ${keyword} 修订 印发` },
-    { engine: 'bing', q: `${keyword} 发布 site:gov.cn` },
+    { engine: 'bing', q: `site:gov.cn ${regionPart} ${keyword} ${year}`.trim() },
+    { engine: 'bing', q: `${regionPart} ${keyword} 通知 印发 ${year}`.trim() },
   ];
+  const fallbackPlan = [
+    { engine: 'bing', q: `${keyword} ${prevYear}-${year} site:gov.cn` },
+    { engine: 'bing', q: `${regionPart} ${keyword} 公布 调整`.trim() },
+    { engine: 'bing', q: `${keyword} 最新文件 ${regionPart} site:gov.cn`.trim() },
+  ];
+  const deepPlan = [
+    { engine: 'bing', q: `${keyword} 施行 ${year} ${regionPart}`.trim() },
+    { engine: 'bing', q: `${regionPart} ${keyword} 修订 印发`.trim() },
+    { engine: 'bing', q: `${keyword} 发布 ${regionPart} site:gov.cn`.trim() },
+    { engine: 'bing', q: `${regionPart} ${keyword} 政策解读 ${year}`.trim() },
+  ];
+  if (compensationMode==='normative-library-recheck') deepPlan.unshift({engine:'bing',q:`${regionPart} ${keyword} 规范性文件库`.trim()});
+  if (compensationMode==='gazette-recheck') deepPlan.unshift({engine:'bing',q:`${regionPart} ${keyword} 政府公报`.trim()});
 
   // 1. 搜索发现：gov.cn 政策库 API 为主力（稳定 JSON），百度/bing SERP 为补充（可能抖动）
   const found = new Map();
@@ -376,9 +411,8 @@ async function discoverBySearch({ keyword, region }) {
   });
   for (const hit of libResult) found.set(hit.url, hit);
 
-  // 顺序执行搜索（避免并发触发搜索引擎限流）
   const searchResults = [];
-  for (const { engine, q } of searchPlan) {
+  async function runOne({ engine, q }) {
     let results = [];
     if (engine === 'baidu') {
       results = await baiduSearch(q, 10).catch((e) => {
@@ -391,15 +425,29 @@ async function discoverBySearch({ keyword, region }) {
         return [];
       });
     }
-    searchResults.push({ engine, query: q.slice(0, 40), results });
-    // 每次搜索后短暂延迟，降低被限流概率
-    await new Promise((r) => setTimeout(r, 500));
+    searchResults.push({ engine, query: q.slice(0, 50), results });
+    for (const hit of results) if (!found.has(hit.url)) found.set(hit.url, hit);
   }
-  for (const { results } of searchResults) {
-    for (const hit of results) {
-      if (!found.has(hit.url)) found.set(hit.url, hit);
+  async function runPlan(plan, concurrency = 2) {
+    const jobs = Array.from(plan || []);
+    let next = 0;
+    async function worker() {
+      while (true) {
+        const i = next++;
+        if (i >= jobs.length) return;
+        await runOne(jobs[i]);
+        await new Promise((r) => setTimeout(r, 120));
+      }
     }
+    await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length || 1) }, () => worker()));
   }
+
+  // gov.cn 政策库已有足量结果时，只补一条地区定向搜索；不足时才扩展剩余查询。
+  await runPlan(primaryPlan.slice(0, 1), 1);
+  if (found.size < 4) await runPlan(primaryPlan.slice(1), 2);
+  if (found.size < 4) await runPlan(fallbackPlan, 2);
+  const forceModeSearch=['site-search-fallback','normative-library-recheck','gazette-recheck'].includes(compensationMode);
+  if (process.env.CRAWL_SEARCH_DEPTH === 'deep' && (found.size < 8 || forceModeSearch)) await runPlan(deepPlan, 2);
 
   // 优先保留gov域名链接
   const govHits = [...found.values()]
@@ -426,7 +474,7 @@ async function discoverBySearch({ keyword, region }) {
  */
 async function candidatesToItems(candidates, { keyword = '', region = '' } = {}) {
   // 2. 并行抓详情页
-  const pages = await Promise.allSettled(candidates.map((h) => fetchPolicyText(h.url)));
+  const pages = await allSettledLimit(candidates, Number(process.env.CRAWL_DETAIL_CONCURRENCY || 3), (h) => fetchPolicyText(h.url));
   console.log(`[crawler] 详情页成功 ${pages.filter((p) => p.status === 'fulfilled').length}/${pages.length}`);
 
   // 3. 地区过滤基准（非全国时只保留目标省或全国性政策）
@@ -446,8 +494,9 @@ async function candidatesToItems(candidates, { keyword = '', region = '' } = {})
 
     const provRaw = inferRegion(`${title} ${bodyText.slice(0, 500)}`, '');
     if (targetProv && provRaw && provRaw !== targetProv) { console.log(`[crawler] 丢弃(非目标省 ${provRaw}): ${title.slice(0, 30)}`); continue; }
-    // 无省份归属的按全国性政策保留（正式库也有「省份：全国」的记录形态）
-    const prov = provRaw || '全国';
+    // 定向地区任务的搜索词已包含地区；正文未重复写省名时仍归入该批次地区。
+    // 只有全国任务且页面本身也无法判定地区时，才归为全国。
+    const prov = regionKey(region && region !== '全国' ? region : (provRaw || targetProv)) || '全国';
 
     const ex = llm.aiExtractFromText(`${title}\n${bodyText.slice(0, 2000)}`);
     const amountM = /(\d{3,5})\s*元[/.]?\s*(月|小时|日|天)?/.exec(bodyText);
@@ -517,8 +566,10 @@ async function candidatesToItems(candidates, { keyword = '', region = '' } = {})
   // 4.5 可选 AI 精提取补全（LLM 配置后才启用）：补正则抓不到/抓不准的文号、机关、
   //     生效日期、金额、摘要。原则：只填空、必校验格式，绝不覆盖正则已确认的关键字段。
   if (items.length && llm.llmEnabled()) {
-    const aiResults = await Promise.allSettled(
-      items.map((it) => llm.aiExtractCrawl(`${it.title || ''}\n${(it.content || '').slice(0, 2500)}`)),
+    const aiResults = await allSettledLimit(
+      items,
+      Number(process.env.CRAWL_LLM_CONCURRENCY || 2),
+      (it) => llm.aiExtractCrawl(`${it.title || ''}\n${(it.content || '').slice(0, 2500)}`),
     );
     let filled = 0;
     aiResults.forEach((r, i) => {
@@ -547,8 +598,10 @@ async function candidatesToItems(candidates, { keyword = '', region = '' } = {})
   //     最佳值映射，confirm 时由 buildWriteFields 真实写入对应数值/日期列）。
   if (items.length) {
     let withSuggest = 0;
-    const enriched = await Promise.allSettled(
-      items.map(async (it) => {
+    const enriched = await allSettledLimit(
+      items,
+      Number(process.env.CRAWL_LLM_CONCURRENCY || 2),
+      async (it) => {
         const src = POLICY_SOURCES.find((s) => s.category === it.category);
         if (!src) return null;
         const cols = [
@@ -582,7 +635,7 @@ async function candidatesToItems(candidates, { keyword = '', region = '' } = {})
         it.values = vmap;
         withSuggest += 1;
         return it;
-      }),
+      },
     );
     void enriched;
     console.log(`[crawler] 表字段候选 ${withSuggest}/${items.length} 条`);

@@ -113,7 +113,11 @@ if (NODE_ENV === 'production' && String(MOCK_LOGIN).toLowerCase() === 'true') {
 section('② OAuth 回调地址');
 let siteOrigin = BASE_URL.replace(/\/+$/, '');
 if (!REDIRECT_URI) {
-  bad('FEISHU_REDIRECT_URI 缺失', '填 https://你的域名/auth/callback');
+  if (LOCAL_ONLY || MOCK_LOGIN === 'true') {
+    warn('FEISHU_REDIRECT_URI 未配置（本地 mock 模式，不影响运行）', '生产必须设置 https://正式域名/auth/callback');
+  } else {
+    bad('FEISHU_REDIRECT_URI 缺失', '填 https://你的域名/auth/callback');
+  }
 } else {
   let u = null;
   try {

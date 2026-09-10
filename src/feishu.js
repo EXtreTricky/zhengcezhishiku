@@ -8,6 +8,17 @@
  */
 
 const FEISHU_BASE = 'https://open.feishu.cn';
+const FEISHU_AUTH_TIMEOUT_MS = Math.max(1000, Number(process.env.FEISHU_AUTH_TIMEOUT_MS || 12000));
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = FEISHU_AUTH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /** 组装授权跳转地址：用户浏览器 302 到这里，飞书校验身份后带 code 回跳 redirect_uri */
 function buildAuthorizeUrl({ appId, redirectUri, state, scope }) {
@@ -21,7 +32,7 @@ function buildAuthorizeUrl({ appId, redirectUri, state, scope }) {
 
 async function postJson(pathname, body) {
   const url = new URL(pathname, FEISHU_BASE);
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json; charset=utf-8' },
     body: JSON.stringify(body),
@@ -71,7 +82,7 @@ function refreshToken({ appId, appSecret, refreshToken }) {
 /** 凭 user_access_token 取当前登录用户的身份信息 */
 async function getUserInfo(userAccessToken) {
   const url = new URL('/open-apis/authen/v1/user_info', FEISHU_BASE);
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     headers: { Authorization: `Bearer ${userAccessToken}` },
   });
   const json = await res.json();

@@ -307,6 +307,9 @@ function llmEnabled() {
 async function chatJSON({ system, user, temperature = 0 }) {
   const c = openAIConfig();
   if (!c.baseUrl || !c.apiKey) return null;
+  const timeoutMs = Math.max(1000, Number(process.env.LLM_TIMEOUT_MS || 12000));
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const resp = await fetch(c.baseUrl.replace(/\/$/, '') + '/chat/completions', {
       method: 'POST',
@@ -320,6 +323,7 @@ async function chatJSON({ system, user, temperature = 0 }) {
           { role: 'user', content: user },
         ],
       }),
+      signal: controller.signal,
     });
     if (!resp.ok) return null;
     const data = await resp.json();
@@ -329,7 +333,11 @@ async function chatJSON({ system, user, temperature = 0 }) {
     if (start === -1) return null;
     return JSON.parse(content.slice(start, content.lastIndexOf('}') + 1));
   } catch (err) {
+    if (err && err.name === 'AbortError') console.warn(`[llm] 请求超时 ${timeoutMs}ms，已降级为本地规则`);
+    else console.warn(`[llm] 请求失败，已降级为本地规则: ${String(err && err.message || err).slice(0, 160)}`);
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 

@@ -146,18 +146,10 @@ function mapRecord(opts) {
     (roles.title && TITLE_FALLBACK_EXCLUDE_NAMES.some((k) => roles.title.includes(k)));
 
   if (!title || titleIsBad) {
-    const srcValue = source ? pickByNames(fields, source.valueFields) : '';
-    const srcDate = source ? pickByNames(fields, source.dateFields) : '';
-    const label = (source && source.label) || '政策';
-    const shortValue = srcValue.length > 30 ? `${srcValue.slice(0, 30)}…` : srcValue;
-    const valuePart = shortValue ? `${label} ${shortValue}` : label;
-    const effective = srcDate || pick(fields, roles.effectiveDate) || '';
-    const parts = [
-      region,
-      city !== region ? city : '',
-      valuePart,
-      effective && `${effective} 生效`,
-    ].filter(Boolean);
+    // 标题只保留「省份 城市」：口径值（如"大病医疗扣除 否"）与生效日期在详情页字段明细中
+    // 已完整展示，拼进标题会让查找列表长短不一、难以扫读。
+    // 例：原「辽宁 大连 大病医疗扣除 否」→ 现「辽宁 大连」
+    const parts = [region, city !== region ? city : ''].filter(Boolean);
     if (parts.length >= 1) {
       title = parts.join(' ');
     } else {

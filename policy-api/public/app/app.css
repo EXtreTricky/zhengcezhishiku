@@ -213,29 +213,29 @@ table.t{width:100%;border-collapse:collapse;font-size:13px}
 /* ── 详情抽屉 ── */
 .mask{position:fixed;inset:0;background:rgba(16,20,28,.32);backdrop-filter:blur(2px);z-index:50;opacity:0;visibility:hidden;transition:.2s}
 .mask.on{opacity:1;visibility:visible}
-.drawer{position:fixed;top:0;right:0;bottom:0;width:min(500px,94vw);background:var(--surface);border-left:1px solid var(--hair);box-shadow:var(--sh-drawer);z-index:60;transform:translateX(103%);transition:transform .28s cubic-bezier(.3,.7,.3,1);display:flex;flex-direction:column}
+.drawer{position:fixed;top:0;right:0;bottom:0;width:min(880px,96vw);background:var(--surface);border-left:1px solid var(--hair);box-shadow:var(--sh-drawer);z-index:60;transform:translateX(103%);transition:transform .28s cubic-bezier(.3,.7,.3,1);display:flex;flex-direction:column}
 .drawer.open{transform:none}
-.dw-head{flex:none;display:flex;align-items:center;gap:10px;padding:14px 16px 10px;border-bottom:1px solid var(--hair)}
-.dw-tags{display:flex;gap:7px;align-items:center}
+.dw-head{flex:none;display:flex;align-items:center;gap:12px;padding:20px 26px 14px;border-bottom:1px solid var(--hair)}
+.dw-tags{display:flex;gap:8px;align-items:center}
 .dw-head .iconbtn{margin-left:auto}
-.dw-scroll{flex:1;overflow-y:auto;padding:16px 18px 40px}
-.dw-title{font-size:18px;font-weight:660;line-height:1.5;letter-spacing:-.01em}
-.dw-meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:12px}
-.dw-meta .mbit{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--ink-2);background:var(--surface-2);border:1px solid var(--hair);padding:4px 10px;border-radius:8px}
-.dw-meta .mbit svg{width:12px;height:12px;color:var(--ink-4)}
-.dw-links{display:flex;gap:14px;margin-top:13px;padding-bottom:15px;border-bottom:1px solid var(--hair)}
-.link{display:inline-flex;align-items:center;gap:6px;font-size:12.8px;font-weight:550;color:var(--brand);cursor:pointer}
-.link svg{width:13px;height:13px}
+.dw-scroll{flex:1;overflow-y:auto;padding:24px 28px 56px}
+.dw-title{font-size:25px;font-weight:680;line-height:1.45;letter-spacing:-.015em}
+.dw-meta{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
+.dw-meta .mbit{display:inline-flex;align-items:center;gap:7px;font-size:13.5px;color:var(--ink-2);background:var(--surface-2);border:1px solid var(--hair);padding:7px 13px;border-radius:9px}
+.dw-meta .mbit svg{width:14px;height:14px;color:var(--ink-4)}
+.dw-links{display:flex;gap:20px;margin-top:18px;padding-bottom:20px;border-bottom:1px solid var(--hair)}
+.link{display:inline-flex;align-items:center;gap:7px;font-size:14.5px;font-weight:550;color:var(--brand);cursor:pointer}
+.link svg{width:15px;height:15px}
 .link:hover{color:var(--brand-strong)}
-.dw-sec{margin-top:18px}
-.dw-sec h3{font-size:12px;font-weight:600;color:var(--ink-3);letter-spacing:.04em;margin-bottom:10px;display:flex;align-items:center;gap:8px}
+.dw-sec{margin-top:26px}
+.dw-sec h3{font-size:13.5px;font-weight:620;color:var(--ink-3);letter-spacing:.04em;margin-bottom:13px;display:flex;align-items:center;gap:9px}
 .dw-sec h3::after{content:"";flex:1;height:1px;background:var(--hair)}
-.fkv{display:grid;grid-template-columns:150px 1fr;gap:0;font-size:12.8px}
-.fkv dt{padding:7px 10px 7px 0;color:var(--ink-3);border-bottom:1px solid var(--hair);word-break:break-all}
-.fkv dd{padding:7px 0 7px 10px;color:var(--ink);border-bottom:1px solid var(--hair);word-break:break-word;min-width:0}
+.fkv{display:grid;grid-template-columns:210px 1fr;gap:0;font-size:15.2px}
+.fkv dt{padding:13px 16px 13px 0;color:var(--ink-3);border-bottom:1px solid var(--hair);word-break:break-all;line-height:1.6}
+.fkv dd{padding:13px 0 13px 16px;color:var(--ink);border-bottom:1px solid var(--hair);word-break:break-word;min-width:0;line-height:1.7}
 .fkv dd a{color:var(--brand)}
 .fkv dt:last-of-type, .fkv dd:last-of-type{border-bottom:none}
-.dw-content{font-size:13px;line-height:1.9;color:var(--ink-2);white-space:pre-wrap;word-break:break-word;background:var(--surface-2);border:1px solid var(--hair);border-radius:10px;padding:14px 16px}
+.dw-content{font-size:15px;line-height:2;color:var(--ink-2);white-space:pre-wrap;word-break:break-word;background:var(--surface-2);border:1px solid var(--hair);border-radius:12px;padding:20px 22px}
 
 /* ── 响应式 ── */
 @media (max-width:1280px){
@@ -250,6 +250,12 @@ table.t{width:100%;border-collapse:collapse;font-size:13px}
   .kpis{grid-template-columns:1fr}
   .hero{flex-direction:column;align-items:flex-start}
   .hero .h-right{margin-left:0}
+  /* 窄屏：字段改为上下堆叠，避免 210px 标签列挤压正文 */
+  .dw-scroll{padding:18px 16px 44px}
+  .dw-title{font-size:20px}
+  .fkv{grid-template-columns:1fr;font-size:14.5px}
+  .fkv dt{padding:10px 0 2px;border-bottom:none;color:var(--ink-4);font-size:12.5px}
+  .fkv dd{padding:0 0 11px}
 }
 
 /* ── 矩阵巡检 · 实时进度条（liverun） ── */

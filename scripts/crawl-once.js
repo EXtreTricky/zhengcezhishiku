@@ -26,5 +26,6 @@ const [keyword, region] = process.argv.slice(2);
     process.stdout.write('\n__RESULT__' + JSON.stringify({ ok: true, items }));
   } catch (err) {
     process.stdout.write('\n__RESULT__' + JSON.stringify({ ok: false, error: err.message, items: [] }));
+    process.exitCode = 1;
   }
 })();

@@ -21,7 +21,7 @@ const HOST_BLACKLIST = [
   'xueqiu.com', '36kr.com', 'ithome.com', 'jiemian.com', 'caixin.com',
   'thepaper.cn', 'bjnews.com.cn', 'stcn.com', 'yicai.com', 'nbd.com.cn',
   'ifeng.com', 'netease.com', 'sogou.com', 'people.com.cn',
-  'xinhuanet.com', 'chinanews.com.cn',
+  'xinhuanet.com', 'chinanews.com.cn', 'sohu.com',
 ];
 
 /** 政府域名后缀（白名单）：.gov.cn 及其子域 */

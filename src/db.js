@@ -15,6 +15,9 @@ const DATA_DIR = path.join(__dirname, '..', 'data');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
 
 let _db = null;
+// 磁盘 db.json 的最后修改时间（毫秒）。用于检测子进程（sweep-crawl）是否已改写文件，
+// 使长驻 server 无需等子进程退出就能看到最新入池数据。
+let _diskMtime = 0;
 
 function uid(prefix = 'id') {
   return `${prefix}_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
@@ -73,6 +76,7 @@ function load() {
   if (_db) return _db;
   try {
     if (fs.existsSync(DB_FILE)) {
+      try { _diskMtime = fs.statSync(DB_FILE).mtimeMs; } catch (_) {}
       const raw = fs.readFileSync(DB_FILE, 'utf8');
       _db = JSON.parse(raw);
       // 防御性补全：旧版本 db.json 可能缺新集合 / config 子键
@@ -97,12 +101,38 @@ function load() {
   return _db;
 }
 
-function save() {
+/**
+ * 保存数据库。
+ * @param {{ touchedKeys?: string[] }} opts - 如果指定 touchedKeys，子进程只覆盖这些 key，
+ *   其余数据从磁盘最新版本合并（防止子进程持有旧快照覆盖主进程的审批状态）。
+ */
+function save(opts = {}) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   _db.meta.updatedAt = nowIso();
+
+  let toWrite = _db;
+  if (opts.touchedKeys && opts.touchedKeys.length) {
+    // 外部写入模式：从磁盘读最新版，只合并本进程修改的 key
+    let diskDb = null;
+    try {
+      if (fs.existsSync(DB_FILE)) {
+        diskDb = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+      }
+    } catch (_) {}
+    if (diskDb) {
+      toWrite = { ...diskDb };
+      for (const k of opts.touchedKeys) {
+        toWrite[k] = _db[k];
+      }
+      toWrite.meta = { ...diskDb.meta, updatedAt: nowIso() };
+    }
+  }
+
   const tmp = DB_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(_db, null, 2), 'utf8');
+  fs.writeFileSync(tmp, JSON.stringify(toWrite, null, 2), 'utf8');
   fs.renameSync(tmp, DB_FILE);
+  // 自己刚写过的盘不能被误判为"外部变更"，否则下次读取会白白 reload 一次
+  try { _diskMtime = fs.statSync(DB_FILE).mtimeMs; } catch (_) {}
 }
 
 /** 让外部模块拿到当前 db 引用（只读使用）；所有写操作后必须调 save() */
@@ -118,6 +148,28 @@ function getDb() {
 function reload() {
   _db = null;
   return load();
+}
+/**
+ * 若磁盘 db.json 已被其它进程改写，则丢弃本进程快照重读。
+ *
+ * 场景：sweep-crawl 子进程每爬完一格就落盘一次（新入池政策写入 crawlQueue），
+ * 而长驻 server 持有的是旧内存快照。原先只在子进程整轮退出时 reload 一次，
+ * 导致巡检过程中待审批列表 / 计数完全不更新，要等整轮跑完才一次性刷新。
+ * 读取前调用本函数（仅一次 statSync，开销可忽略）即可让列表随入池实时增长。
+ *
+ * @returns {boolean} 是否发生了重载
+ */
+function syncIfChanged() {
+  try {
+    if (!fs.existsSync(DB_FILE)) return false;
+    const m = fs.statSync(DB_FILE).mtimeMs;
+    if (m !== _diskMtime) {
+      _db = null;
+      load();
+      return true;
+    }
+  } catch (_) {}
+  return false;
 }
 function reset() {
   _db = emptyDb();
@@ -140,4 +192,4 @@ function paginate(items, page = 1, pageSize = 20) {
   };
 }
 
-module.exports = { load, save, reset, reload, getDb, uid, nowIso, daysFromNow, clone, paginate };
+module.exports = { load, save, reset, reload, syncIfChanged, getDb, uid, nowIso, daysFromNow, clone, paginate };

@@ -13,8 +13,10 @@ const https = require('https');
 const http = require('http');
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
-const TIMEOUT = 10000;
-const PAGE_GAP_MS = 400; // 温和限速
+const TIMEOUT = Math.max(2500, parseInt(process.env.ENUM_HTTP_TIMEOUT_MS || '6000', 10) || 6000);
+const RETRIES = Math.max(0, Math.min(2, parseInt(process.env.ENUM_HTTP_RETRIES || '0', 10) || 0));
+const CHANNEL_CONCURRENCY = Math.max(1, Math.min(4, parseInt(process.env.ENUM_CHANNEL_CONCURRENCY || '2', 10) || 2));
+const PAGE_GAP_MS = Math.max(100, parseInt(process.env.ENUM_PAGE_GAP_MS || '300', 10) || 300); // 温和限速
 
 /** 栏目源注册表
  *  type: 'page'  —— 列表分页型（现有模式）
@@ -24,164 +26,83 @@ const PAGE_GAP_MS = 400; // 温和限速
  *  type: 'sitemap' —— 全站 sitemap.xml 索引型（一次性拿 N 多条目，按 path 前缀过滤）
  *    提供：sitemapUrl、pathPrefixes（任一前缀命中即纳入）、cachePath（本地缓存避免每次重拉；不存在时拉一次落到磁盘）
  */
-const PROVINCE_CHANNELS = {
-  广东省: [
-    {
-      label: '省人社厅·规范性文件',
-      type: 'page',
-      pageCount: 39,
-      pageUrl: (n) =>
-        n <= 1
-          ? 'https://hrss.gd.gov.cn/zwgk/xxgkml/bmwj/gfxwj/index.html'
-          : `https://hrss.gd.gov.cn/zwgk/xxgkml/bmwj/gfxwj/index_${n}.html`,
-      detailUrlRe: /content\/post_/,
-      // 列表容器 + 条目：<li><a href=绝对URL title=标题>…</a><span class="pubDate">YYYY-MM-DD</span></li>
-      listRe: /<ul class="list"[^>]*>([\s\S]*?)<\/ul>/i,
-      itemRe: /<a href="([^"]+)" title="([^"]+)">[\s\S]*?(?:<span class="pubDate"[^>]*>(\d{4}-\d{2}-\d{2}))?/g,
-    },
-    {
-      label: '省人社厅·政策解读',
-      type: 'sitemap',
-      sitemapUrl: 'https://hrss.gd.gov.cn/sitemap.xml',
-      pathPrefixes: ['zcfg/zcjd/'], // 仅留以 /zcfg/zcjd/ 开头的政策解读类详情页
-      cachePath: '.workbuddy/_enum-cache/gd-sitemap.xml',
-    },
-    {
-      label: '省人社厅·公示公告',
-      type: 'sitemap',
-      sitemapUrl: 'https://hrss.gd.gov.cn/sitemap.xml',
-      pathPrefixes: ['zwgk/gsgg/'],
-      cachePath: '.workbuddy/_enum-cache/gd-sitemap.xml',
-    },
-    {
-      label: '省人社厅·信息公开目录',
-      type: 'sitemap',
-      sitemapUrl: 'https://hrss.gd.gov.cn/sitemap.xml',
-      pathPrefixes: ['zwgk/xxgkml/'], // 整个母目录（含 gfxwj/通知公告/部门文件等多个子栏目）
-      cachePath: '.workbuddy/_enum-cache/gd-sitemap.xml',
-    },
+// 旧全称条目已清除，统一由 crawl-regions.js PROVINCES 动态注册 + discover 兜底
+const PROVINCE_CHANNELS = {};
+
+
+// 每个省都保留一个“官方根站自动发现”兜底源。
+// 不能只给缺省份加 discover：固定栏目一旦改版/404，如果没有 discover，整省会直接失联。
+const { PROVINCES } = require('./crawl-regions');
+for (const p of PROVINCES) {
+  if (!PROVINCE_CHANNELS[p.name]) PROVINCE_CHANNELS[p.name] = [];
+  const channels = PROVINCE_CHANNELS[p.name];
+  if (!channels.some((x) => x.type === 'discover')) {
+    const fixedSeeds = [];
+    for (const ch of channels) {
+      try {
+        if (typeof ch.pageUrl === 'function') fixedSeeds.push(ch.pageUrl(1));
+        if (ch.sitemapUrl) fixedSeeds.push(ch.sitemapUrl);
+      } catch (_) {}
+    }
+    channels.push({
+      label: `${p.name}政府网·自动发现兜底`,
+      type: 'discover',
+      rootUrl: p.root,
+      seedUrls: [...new Set(fixedSeeds.filter(Boolean))].slice(0, 4),
+      keywords: ['政策', '政策文件', '政府文件', '规范性文件', '行政规范性文件', '政府公报', '人力资源', '社会保障'],
+    });
+  }
+}
+
+const VERIFIED_DISCOVERY_SEEDS = {
+  '吉林省': [
+    'https://www.jl.gov.cn/zcxx/zfwj/wap.html',
+    'https://www.jl.gov.cn/zcxx/',
+    'https://hrss.jl.gov.cn/flfg/',
   ],
-  福建省: [
-    {
-      // 结构取证：<ul class="clearflx nyncgl-box-list"><li><a href="相对.htm" title="标题"><span class="bf-pass">日期</span>…<p>标题</p></a>
-      // 单页全量（无翻页），详情 URL 形如 /zw/gsgg/202608/t20260805_7196556.htm
-      label: '省人社厅·公示公告',
-      type: 'page',
-      pageCount: 1,
-      pageUrl: () => 'https://rst.fujian.gov.cn/zw/gsgg/',
-      detailUrlRe: /\/t\d+_\d+\.htm$/,
-      listRe: null, // 全页按 itemRe 抓（页面含多个 nyncgl tab 容器，不截断）
-      // 取证结构：<a href="../…t20260901_7207218.htm" title="标题" target="_blank"><span class="bf-pass">2026-09-01</span>
-      // title 后可能跟 target 等其它属性 → [^>]* 兜住；[^>] 不跨标签，安全
-      itemRe: /<a[^>]+href="([^"]+)"[^>]+title="([^"]+)"[^>]*>[\s\S]*?<span class="bf-pass">(\d{4}-\d{2}-\d{2})<\/span>/g,
-    },
-    {
-      label: '省人社厅·部门政策文件解读',
-      type: 'page',
-      pageCount: 1,
-      pageUrl: () => 'https://rst.fujian.gov.cn/zcjd/zcjd/bmzcwjjd/',
-      detailUrlRe: /\/t\d+_\d+\.htm$/,
-      listRe: null, // 全页按 itemRe 抓（页面含多个 nyncgl tab 容器，不截断）
-      // 取证结构：<a href="../…t20260901_7207218.htm" title="标题" target="_blank"><span class="bf-pass">2026-09-01</span>
-      // title 后可能跟 target 等其它属性 → [^>]* 兜住；[^>] 不跨标签，安全
-      itemRe: /<a[^>]+href="([^"]+)"[^>]+title="([^"]+)"[^>]*>[\s\S]*?<span class="bf-pass">(\d{4}-\d{2}-\d{2})<\/span>/g,
-    },
-    {
-      label: '省人社厅·其他政策文件解读',
-      type: 'page',
-      pageCount: 1,
-      pageUrl: () => 'https://rst.fujian.gov.cn/zcjd/zcjd/qtzcwjjd/',
-      detailUrlRe: /\/t\d+_\d+\.htm$/,
-      listRe: null, // 全页按 itemRe 抓（页面含多个 nyncgl tab 容器，不截断）
-      // 取证结构：<a href="../…t20260901_7207218.htm" title="标题" target="_blank"><span class="bf-pass">2026-09-01</span>
-      // title 后可能跟 target 等其它属性 → [^>]* 兜住；[^>] 不跨标签，安全
-      itemRe: /<a[^>]+href="([^"]+)"[^>]+title="([^"]+)"[^>]*>[\s\S]*?<span class="bf-pass">(\d{4}-\d{2}-\d{2})<\/span>/g,
-    },
+  '内蒙古自治区': [
+    'https://www.nmg.gov.cn/zwgk/',
+    'https://www.nmg.gov.cn/zfbgt/zwgk/zzqwj/',
   ],
-  北京市: [
-    // 取证：<a href="./202608/t20260821_4831461.html" target="_blank">标题</a>（标题在 a 内，URL 含 t2026xxxx_）
-    { label: '市人社局·政策文件', type: 'page', pageCount: 10, pageUrl: (n) => n <= 1 ? 'https://rsj.beijing.gov.cn/xxgk/2024zcwj/' : `https://rsj.beijing.gov.cn/xxgk/2024zcwj/index_${n}.html`, detailUrlRe: /\/t\d+_\d+\.html$/, listRe: null, itemRe: /<a[^>]+href="([^"]+)"[^>]*>([\s\S]{4,}?)<\/a>/g },
-    { label: '市人社局·公示公告', type: 'page', pageCount: 10, pageUrl: (n) => n <= 1 ? 'https://rsj.beijing.gov.cn/xxgk/tzgg/' : `https://rsj.beijing.gov.cn/xxgk/tzgg/index_${n}.html`, detailUrlRe: /\/t\d+_\d+\.html$/, listRe: null, itemRe: /<a[^>]+href="([^"]+)"[^>]*>([\s\S]{4,}?)<\/a>/g },
-    { label: '市人社局·政策解读', type: 'page', pageCount: 10, pageUrl: (n) => n <= 1 ? 'https://rsj.beijing.gov.cn/xxgk/2024zcjd/' : `https://rsj.beijing.gov.cn/xxgk/2024zcjd/index_${n}.html`, detailUrlRe: /\/t\d+_\d+\.html$/, listRe: null, itemRe: /<a[^>]+href="([^"]+)"[^>]*>([\s\S]{4,}?)<\/a>/g },
+  '广西壮族自治区': [
+    'https://www.gxzf.gov.cn/html///zfwj/zzqrmzfbgtwj_34828/',
+    'https://rst.gxzf.gov.cn/zwgk/xxgkzcfg/gxflfg/',
   ],
-  上海市: [
-    // 取证：<a href="/tshbx_17729/20260812/t0035_1443067.html" target="_blank" title="标题">…</a>
-    { label: '市人社局·规范性文件', type: 'page', pageCount: 10, pageUrl: (n) => `https://rsj.sh.gov.cn/tgwgfx_17726/index${n <= 1 ? '' : '_' + n}.html`, detailUrlRe: /\/t\d+_\d+\.html$/, listRe: null, itemRe: /<a[^>]+href="([^"]+)"[^>]*title="([^"]+)"[^>]*>/g },
-    { label: '市人社局·公示公告', type: 'page', pageCount: 10, pageUrl: (n) => `https://rsj.sh.gov.cn/tgsgg_17341/index${n <= 1 ? '' : '_' + n}.html`, detailUrlRe: /\/t\d+_\d+\.html$/, listRe: null, itemRe: /<a[^>]+href="([^"]+)"[^>]*title="([^"]+)"[^>]*>/g },
-    { label: '市人社局·政策解读', type: 'page', pageCount: 10, pageUrl: (n) => `https://rsj.sh.gov.cn/tzcjd_17351/index${n <= 1 ? '' : '_' + n}.html`, detailUrlRe: /\/t\d+_\d+\.html$/, listRe: null, itemRe: /<a[^>]+href="([^"]+)"[^>]*title="([^"]+)"[^>]*>/g },
+  '贵州省': [
+    'https://www.guizhou.gov.cn/zwgk/zcfg/',
+    'https://rst.guizhou.gov.cn/',
   ],
-  天津市: [
-    // 取证：<a href='./202609/t20260903_7365587.html' title='标题' target="_blank"><span class="fl">…</span><span class="fr">2026-09-04</span>
-    { label: '市人社局·政策文件', type: 'page', pageCount: 1, pageUrl: () => 'https://hrss.tj.gov.cn/zhengwugongkai/zhengcezhinan/zxwjnew/', detailUrlRe: /\/t\d+_\d+\.html$/, listRe: null, itemRe: /<a[^>]+href=["']([^"']+t\d+_\d+\.html)["'][^>]*title=["']([^"']+)["'][^>]*>[\s\S]*?(?:<span class="fr"[^>]*>(\d{4}-\d{2}-\d{2}))?/g },
-    { label: '市人社局·公告公示', type: 'page', pageCount: 10, pageUrl: (n) => n <= 1 ? 'https://hrss.tj.gov.cn/xinwenzixun/gggsnew/' : `https://hrss.tj.gov.cn/xinwenzixun/gggsnew/index_${n}.html`, detailUrlRe: /\/t\d+_\d+\.html$/, listRe: null, itemRe: /<a[^>]+href=["']([^"']+t\d+_\d+\.html)["'][^>]*title=["']([^"']+)["'][^>]*>[\s\S]*?(?:<span class="fr"[^>]*>(\d{4}-\d{2}-\d{2}))?/g },
-    { label: '市人社局·政策解读', type: 'page', pageCount: 10, pageUrl: (n) => n <= 1 ? 'https://hrss.tj.gov.cn/zhengwugongkai/zhengcezhinan/zcjdnew/' : `https://hrss.tj.gov.cn/zhengwugongkai/zhengcezhinan/zcjdnew/index_${n}.html`, detailUrlRe: /\/t\d+_\d+\.html$/, listRe: null, itemRe: /<a[^>]+href=["']([^"']+t\d+_\d+\.html)["'][^>]*title=["']([^"']+)["'][^>]*>[\s\S]*?(?:<span class="fr"[^>]*>(\d{4}-\d{2}-\d{2}))?/g },
+  '云南省': [
+    'https://www.yn.gov.cn/zwgk/zcwj/zxwj/',
+    'https://www.yn.gov.cn/zwgk/zfxxgkpt/gkptzcwj/xzgfxwj/',
   ],
-  重庆市: [
-    // 取证 A(规范性文件)：<a target="_blank" href="./202608/t20260831_16004458.html"><p class="tit">标题</p><p class="info">…
-    { label: '市人社局·行政规范性文件', type: 'page', pageCount: 10, pageUrl: (n) => n <= 1 ? 'https://rlsbj.cq.gov.cn/zwgk_182/zfxxgkml/zcwj_145360/jfxzgfxwj/' : `https://rlsbj.cq.gov.cn/zwgk_182/zfxxgkml/zcwj_145360/jfxzgfxwj/index_${n}.html`, detailUrlRe: /\/t\d+_\d+\.html$/, listRe: null, itemRe: /<a[^>]+href="([^"]+t\d+_\d+\.html)"[^>]*>[\s\S]*?<p class="tit">([\s\S]*?)<\/p>/g },
-    // 取证 B(通知公告)：<a href="../../ztzl/…/202609/t20260904_16031540.html" title="标题" target="_blank">…
-    { label: '市人社局·通知公告', type: 'page', pageCount: 10, pageUrl: (n) => n <= 1 ? 'https://rlsbj.cq.gov.cn/zwxx_182/tzgg/' : `https://rlsbj.cq.gov.cn/zwxx_182/tzgg/index_${n}.html`, detailUrlRe: /\/t\d+_\d+\.html$/, listRe: null, itemRe: /<a[^>]+href="([^"]+t\d+_\d+\.html)"[^>]*title="([^"]+)"[^>]*>/g },
+  '西藏自治区': [
+    'https://www.xizang.gov.cn/zwgk/xxfb/zfwj/',
+    'https://www.xizang.gov.cn/zwgk/xxfb/zbwj/',
+    'https://www.xizang.gov.cn/zwgk/zfgb/',
+    'https://hrss.xizang.gov.cn/xwzx/tzgg/',
   ],
-  浙江省: [
-    // col1229116948（公示公告）经取证为6KB壳页，无静态art链接（0贡献），已移除
-    // 取证 col1389535（最新政策）：20KB静态页含art链接，<a href="/col/.../art/2026/art_xxx.html" class="bt_link" title="标题" target="_blank">
-    // 注：浙江用 jpaas-publish-server 系统，翻页靠JS/AJAX（?page=无效、index_2.html 404），当前仅首页静态~27条，深度翻页待API逆向
-    { label: '省人社厅·最新政策', type: 'page', pageCount: 1, pageUrl: () => 'https://rlsbt.zj.gov.cn/col/col1389535/index.html', detailUrlRe: /\/art\//, listRe: null, itemRe: /<a[^>]+href="([^"]+)"[^>]*title="([^"]+)"[^>]*>/g },
+  '宁夏回族自治区': [
+    'https://www.nx.gov.cn/zwgk/qzfwj/',
+    'https://www.nx.gov.cn/zwgk/qzfwj/list.html',
+    'https://hrss.nx.gov.cn/',
   ],
-  江苏省: [
-    // 取证 A(公示公告)：<a href="/art/2026/8/31/art_78504_11822684.html" target="_blank"><span class="list_title">标题</span><i>2026-08-31</i></a>
-    { label: '省人社厅·公示公告', type: 'page', pageCount: 1, pageUrl: () => 'https://jshrss.jiangsu.gov.cn/col/col78503/index.html', detailUrlRe: /\/art\//, listRe: null, itemRe: /<a[^>]+href="(\/art\/[^"]+)"[^>]*><span class="list_title">([\s\S]*?)<\/span><i>(\d{4}-\d{2}-\d{2})<\/i>/g },
-    // 取证 B(政策解读)：<a target="_blank" href="/art/2025/12/29/art_77261_11701077.html" title="最低工资标准调整政策解读" id="maodian">
-    { label: '省人社厅·政策解读', type: 'page', pageCount: 1, pageUrl: () => 'https://jshrss.jiangsu.gov.cn/col/col77261/index.html', detailUrlRe: /\/art\//, listRe: null, itemRe: /<a[^>]+href="(\/art\/[^"]+)"[^>]*title="([^"]+)"[^>]*>/g },
-  ],
-  山东省: [
-    // 取证：<a href="/articles/ch00330/202609/uuid.shtml" title="标题" target="_blank">…</a>（ch00330 为单页大列表，历年公告全量）
-    { label: '省人社厅·通知公告', type: 'page', pageCount: 1, pageUrl: () => 'https://hrss.shandong.gov.cn/channels/ch00330/', detailUrlRe: /\/articles\/ch\d+\/\d{6}\//, listRe: null, itemRe: /<a[^>]+href="(\/articles\/ch\d+\/\d{6}\/[^"]+\.shtml)"[^>]*>([\s\S]{4,}?)<\/a>/g },
-    { label: '省人社厅·政策法规', type: 'page', pageCount: 1, pageUrl: () => 'https://hrss.shandong.gov.cn/channels/ch00470/', detailUrlRe: /\/articles\/ch\d+\/\d{6}\//, listRe: null, itemRe: /<a[^>]+href="(\/articles\/ch\d+\/\d{6}\/[^"]+\.shtml)"[^>]*>([\s\S]{4,}?)<\/a>/g },
-    { label: '省人社厅·政策解读', type: 'page', pageCount: 1, pageUrl: () => 'https://hrss.shandong.gov.cn/channels/ch00580/', detailUrlRe: /\/articles\/ch\d+\/\d{6}\//, listRe: null, itemRe: /<a[^>]+href="(\/articles\/ch\d+\/\d{6}\/[^"]+\.shtml)"[^>]*>([\s\S]{4,}?)<\/a>/g },
-  ],
-  湖北省: [
-    // 取证：<a href="http://rst.hubei.gov.cn/zfxxgk/zc/zcjd/202608/t20260828_6003076.shtml" class="w80" target="_blank" title="标题">…
-    { label: '省人社厅·政策解读', type: 'page', pageCount: 8, pageUrl: (n) => n <= 1 ? 'http://rst.hubei.gov.cn/zfxxgk/zc/zcjd/' : `http://rst.hubei.gov.cn/zfxxgk/zc/zcjd/index_${n}.html`, detailUrlRe: /\/t\d+_\d+\.shtml$/, listRe: null, itemRe: /<a[^>]+href="([^"]+t\d+_\d+\.shtml)"[^>]*title="([^"]+)"[^>]*>/g },
-    { label: '省人社厅·通知公告', type: 'page', pageCount: 8, pageUrl: (n) => n <= 1 ? 'http://rst.hubei.gov.cn/bmdt/dtyw/tzgg/' : `http://rst.hubei.gov.cn/bmdt/dtyw/tzgg/index_${n}.html`, detailUrlRe: /\/t\d+_\d+\.shtml$/, listRe: null, itemRe: /<a[^>]+href="([^"]+t\d+_\d+\.shtml)"[^>]*title="([^"]+)"[^>]*>/g },
-  ],
-  河南省: [
-    // 取证：<A href="http://hrss.henan.gov.cn/2026/09-02/3410506.html" target="_blank">标题</A>（标签大写，URL 含日期）
-    { label: '省人社厅·公示公告', type: 'page', pageCount: 1, pageUrl: () => 'https://hrss.henan.gov.cn/zwgk/zwdt/gsgg/', detailUrlRe: /\/\d{4}\/\d{2}-\d{2}\/\d+\.html$/, listRe: null, itemRe: /<a[^>]+href="(https?:\/\/hrss\.henan\.gov\.cn\/\d{4}\/\d{2}-\d{2}\/\d+\.html)"[^>]*>([\s\S]{2,}?)<\/a>/gi },
-  ],
-  湖南省: [
-    // 取证：<a href="/rst/xxgk/tzgg/202609/t20260903_34056288.html" target="_blank">标题</a>（zcfg/index.html 为聚合页）
-    { label: '省人社厅·政策法规', type: 'page', pageCount: 1, pageUrl: () => 'http://rst.hunan.gov.cn/rst/xxgk/zcfg/index.html', detailUrlRe: /\/t\d+_\d+\.html$/, listRe: null, itemRe: /<a[^>]+href="([^"]+t\d+_\d+\.html)"[^>]*>([\s\S]{4,}?)<\/a>/g },
-    { label: '省人社厅·通知公告', type: 'page', pageCount: 10, pageUrl: (n) => `http://rst.hunan.gov.cn/rst/xxgk/tzgg/index${n <= 1 ? '' : '_' + n}.html`, detailUrlRe: /\/t\d+_\d+\.html$/, listRe: null, itemRe: /<a[^>]+href="([^"]+t\d+_\d+\.html)"[^>]*>([\s\S]{4,}?)<\/a>/g },
-  ],
-  四川省: [
-    // 取证：<div class="gknr_list"><dl><dd><a href="/rst/gsgg/2026/9/3/UUID.shtml" title="标题"><span>2026-09-03</span></a></dd>
-    // 翻页：zfxxgkpage_N.shtml（100页1000条，createPageHTML 生成），page1≠page2 0重叠
-    { label: '省人社厅·公示公告', type: 'page', pageCount: 10, pageUrl: (n) => `https://rst.sc.gov.cn/rst/gsgg/zfxxgkpage${n <= 1 ? '' : '_' + n}.shtml`, detailUrlRe: /\/rst\/gsgg\/\d{4}\//, listRe: null, itemRe: /<a[^>]+href="([^"]+)"[^>]*title="([^"]+)"[^>]*>[\s\S]*?<span>\s*(\d{4}-\d{2}-\d{2})\s*<\/span>/g },
-  ],
-  安徽省: [
-    // 取证：hrss.ah.gov.cn 政策法规栏目，列表为 <ul class="list"><li><a href title><span class="pubDate">
-    { label: '省人社厅·政策法规', type: 'page', pageCount: 8, pageUrl: (n) => `https://hrss.ah.gov.cn/zwxx/zcfg/index${n <= 1 ? '' : '_' + n}.html`, detailUrlRe: /content\/post_/, listRe: null, itemRe: /<a[^>]+href="([^"]+)"[^>]*title="([^"]+)"[^>]*>[\s\S]*?(?:<span[^>]*>(\d{4}-\d{2}-\d{2}))?/g },
-  ],
-  江西省: [
-    // 取证：rst.jiangxi.gov.cn 通知公告，列表 <div class="list"><ul><li><a href title><span>日期
-    { label: '省人社厅·通知公告', type: 'page', pageCount: 8, pageUrl: (n) => `http://rst.jiangxi.gov.cn/col/col40215/index${n <= 1 ? '' : '_' + n}.html`, detailUrlRe: /\/art\//, listRe: null, itemRe: /<a[^>]+href="([^"]+)"[^>]*title="([^"]+)"[^>]*>[\s\S]*?(?:<span[^>]*>(\d{4}[-/]\d{2}[-/]\d{2}))?/g },
-  ],
-  陕西省: [
-    // 取证：rst.shaanxi.gov.cn 政策法规，列表 <ul class="news-list"><li><a href title><span>日期
-    { label: '省人社厅·政策法规', type: 'page', pageCount: 8, pageUrl: (n) => `https://rst.shaanxi.gov.cn/zfxxgk/zcfg/zcwj/index${n <= 1 ? '' : '_' + n}.html`, detailUrlRe: /\/content\//, listRe: null, itemRe: /<a[^>]+href="([^"]+)"[^>]*title="([^"]+)"[^>]*>[\s\S]*?(?:<span[^>]*>(\d{4}[-/]\d{2}[-/]\d{2}))?/g },
-  ],
-  辽宁省: [
-    // 取证：rst.ln.gov.cn 政策文件，列表 <ul class="list"><li><a href title><span>日期
-    { label: '省人社厅·政策文件', type: 'page', pageCount: 8, pageUrl: (n) => `https://rst.ln.gov.cn/zfxxgk/zcwj/index${n <= 1 ? '' : '_' + n}.html`, detailUrlRe: /\/content\//, listRe: null, itemRe: /<a[^>]+href="([^"]+)"[^>]*title="([^"]+)"[^>]*>[\s\S]*?(?:<span[^>]*>(\d{4}[-/]\d{2}[-/]\d{2}))?/g },
-  ],
-  黑龙江省: [
-    // 取证：hrss.hlj.gov.cn 政策法规，列表 <ul class="news-list"><li><a href title><span>日期
-    { label: '省人社厅·政策法规', type: 'page', pageCount: 8, pageUrl: (n) => `https://hrss.hlj.gov.cn/hljhrss/zcwj/index${n <= 1 ? '' : '_' + n}.html`, detailUrlRe: /\/content\//, listRe: null, itemRe: /<a[^>]+href="([^"]+)"[^>]*title="([^"]+)"[^>]*>[\s\S]*?(?:<span[^>]*>(\d{4}[-/]\d{2}[-/]\d{2}))?/g },
+  '新疆维吾尔自治区': [
+    'https://www.xinjiang.gov.cn/xinjiang/zhengce/zfxxgk_zhengce_31.shtml',
+    'https://www.xinjiang.gov.cn/xinjiang/gfxwj1/zfxxgk_zc_gfxwj.shtml',
+    'https://www.xinjiang.gov.cn/xinjiang/fgwjx/zzzb_list.shtml',
+    'https://www.xinjiang.gov.cn/xinjiang/zfgb/zfgb.shtml',
+    'https://rst.xinjiang.gov.cn/xjrst/zcwj/zfxxgk_gknrz.shtml',
   ],
 };
+for (const [name, urls] of Object.entries(VERIFIED_DISCOVERY_SEEDS)) {
+  const channels=PROVINCE_CHANNELS[name] || [];
+  const discover=channels.find((x)=>x.type==='discover');
+  if (discover) discover.seedUrls=[...new Set([...(discover.seedUrls || []), ...urls])];
+  else channels.push({label:`${name}政府网·补充发现`,type:'discover',rootUrl:PROVINCES.find((p)=>p.name===name)?.root,seedUrls:urls,keywords:['政策','政府文件','规范性文件','公报','人力资源','社会保障']});
+}
 
-function getHtml(url, retried = false) {
+function getHtml(url, attempt = 0) {
   return new Promise((resolve, reject) => {
     const mod = url.startsWith('https') ? https : http;
     const req = mod.get(
@@ -190,16 +111,19 @@ function getHtml(url, retried = false) {
       (res) => {
         if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
           res.resume();
-          return resolve(getHtml(new URL(res.headers.location, url).toString(), retried));
+          return resolve(getHtml(new URL(res.headers.location, url).toString(), attempt));
         }
         const chunks = [];
         res.on('data', (c) => chunks.push(c));
         res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, buf: Buffer.concat(chunks) }));
-        res.on('error', (e) => { if (!retried) resolve(getHtml(url, true)); else reject(e); });
+        res.on('error', reject);
       },
     );
-    req.on('timeout', () => req.destroy(new Error('请求超时')));
-    req.on('error', (e) => { if (!retried) resolve(getHtml(url, true)); else reject(e); });
+    req.on('timeout', () => req.destroy(new Error(`请求超时(${TIMEOUT}ms)`)));
+    req.on('error', (e) => {
+      if (attempt < RETRIES) return resolve(getHtml(url, attempt + 1));
+      reject(e);
+    });
   });
 }
 
@@ -269,6 +193,138 @@ function parseListPage(html, baseUrl, ch = {}) {
   return out;
 }
 
+
+function extractAnchors(html, baseUrl) {
+  const out = [];
+  const re = /<a\b[^>]*href=["']([^"'#]+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(html))) {
+    let url;
+    try { url = new URL(m[1], baseUrl).toString(); } catch (_) { continue; }
+    const title = cleanText(m[2] || '').slice(0, 120);
+    out.push({ url, title });
+  }
+  return out;
+}
+
+function scoreEntry(link, keywords = []) {
+  const hay = `${link.title} ${link.url}`.toLowerCase();
+  let score = 0;
+  for (const k of keywords) if (hay.includes(String(k).toLowerCase())) score += 20;
+  if (/zhengce|zcwj|zfwj|xzgfx|gfxwj|gongbao|zfgb|policy|zwgk/.test(hay)) score += 15;
+  if (/login|signin|video|photo|mail|互动|留言/.test(hay)) score -= 40;
+  return score;
+}
+
+async function mapLimit(list, limit, worker) {
+  const arr = Array.from(list || []);
+  const out = new Array(arr.length);
+  let next = 0;
+  const n = Math.max(1, Math.min(arr.length || 1, Number(limit) || 1));
+  async function run() {
+    while (true) {
+      const i = next++;
+      if (i >= arr.length) return;
+      try { out[i] = { ok: true, value: await worker(arr[i], i) }; }
+      catch (error) { out[i] = { ok: false, error }; }
+    }
+  }
+  await Promise.all(Array.from({ length: n }, () => run()));
+  return out;
+}
+
+async function discoverChannelItems(ch, maxPages = 3, diagnostics = null) {
+  const roots = [...new Set([...(ch.seedUrls || []), ch.rootUrl, new URL('/zwgk/', ch.rootUrl).toString(), new URL('/zhengce/', ch.rootUrl).toString()].filter(Boolean))];
+  const entryMap = new Map();
+  let rootOk = 0;
+  let rootFailed = 0;
+  const errors = [];
+
+  // 根入口有限并发：坏站不再按 URL 一个个累计超时。
+  const rootResults = await mapLimit(roots, CHANNEL_CONCURRENCY, async (root) => {
+    const r = await getHtml(root);
+    return { root, ...r };
+  });
+  for (let i = 0; i < rootResults.length; i++) {
+    const rr = rootResults[i];
+    const root = roots[i];
+    if (!rr.ok) {
+      rootFailed += 1;
+      errors.push(`${root} ${rr.error?.message || rr.error}`);
+      continue;
+    }
+    const { status, headers, buf } = rr.value;
+    if (status !== 200) {
+      rootFailed += 1;
+      errors.push(`${root} HTTP ${status}`);
+      continue;
+    }
+    rootOk += 1;
+    const html = decode(buf, headers['content-type'] || '');
+    for (const a of extractAnchors(html, root)) {
+      const sc = scoreEntry(a, ch.keywords || []);
+      if (sc < 20) continue;
+      const old = entryMap.get(a.url);
+      if (!old || old.score < sc) entryMap.set(a.url, { ...a, score: sc });
+    }
+  }
+
+  const entries = [...entryMap.values()].sort((a,b)=>b.score-a.score).slice(0, Math.max(3, maxPages * 3));
+  const entryTargets = entries.slice(0, Math.max(3, maxPages * 2));
+  const found = new Map();
+  let entryOk = 0;
+  let entryFailed = 0;
+  const baseHost = (() => { try { return new URL(ch.rootUrl).hostname.replace(/^www\./,''); } catch (_) { return ''; } })();
+
+  const entryResults = await mapLimit(entryTargets, CHANNEL_CONCURRENCY, async (entry) => {
+    const r = await getHtml(entry.url);
+    return { entry, ...r };
+  });
+  for (let i = 0; i < entryResults.length; i++) {
+    const er = entryResults[i];
+    const entry = entryTargets[i];
+    if (!er.ok) {
+      entryFailed += 1;
+      errors.push(`${entry.url} ${er.error?.message || er.error}`);
+      continue;
+    }
+    const { status, headers, buf } = er.value;
+    if (status !== 200) {
+      entryFailed += 1;
+      errors.push(`${entry.url} HTTP ${status}`);
+      continue;
+    }
+    entryOk += 1;
+    const html = decode(buf, headers['content-type'] || '');
+    for (const a of extractAnchors(html, entry.url)) {
+      const sameHost = (() => {
+        try {
+          const host = new URL(a.url).hostname.replace(/^www\./,'');
+          return host === baseHost || host.endsWith('.' + baseHost) || baseHost.endsWith('.' + host);
+        } catch (_) { return false; }
+      })();
+      if (!sameHost || !a.title || a.title.length < 5) continue;
+      const hay = `${a.title} ${a.url}`;
+      const policyish = /(政策|通知|办法|规定|意见|标准|实施|细则|公报|工资|公积金|津贴|产假|育儿假|医疗|残保金|社会保障|人力资源)/.test(hay) || /\/art\/|content|t20\d{6}|\.shtml|\.html/.test(a.url);
+      if (!policyish) continue;
+      if (/index(?:_\d+)?\.s?html?$|\/index\/?$/i.test(a.url)) continue;
+      found.set(a.url, { url: a.url, title: a.title, publishDate: dateFromUrl(a.url) });
+    }
+  }
+
+  if (entryTargets.length) await new Promise((r)=>setTimeout(r, PAGE_GAP_MS));
+  if (diagnostics) Object.assign(diagnostics, {
+    roots: roots.length,
+    rootOk,
+    rootFailed,
+    entriesDiscovered: entries.length,
+    entryOk,
+    entryFailed,
+    errors: errors.slice(-8),
+  });
+  return [...found.values()];
+}
+
 /** 读/写本地缓存：先 fs 读，失败则 https 拉一次落盘再读。返回字符串 xml。 */
 async function loadOrFetchSitemap(cachePath, sitemapUrl) {
   const fs = require('fs');
@@ -314,64 +370,140 @@ function parseSitemap(xml, pathPrefixes = []) {
  * @param {{maxPages?: number, since?: string, onPage?: (p:number,total:number,got:number)=>void}} opts
  * @returns {Promise<Array<{url,title,publishDate,province,channel}>>}
  */
-async function enumerateProvince(province, opts = {}) {
+async function processChannel(province, ch, opts = {}) {
+  const { maxPages = Infinity, since = '', onPage } = opts;
+  const diag = { label: ch.label, type: ch.type || 'page', ok: false, requests: 0, success: 0, failed: 0, itemCount: 0, lastError: '', errors: [] };
+  const localItems = [];
+
+  if ((ch.type || 'page') === 'page') {
+    let emptyStreak = 0;
+    const total = Math.min(ch.pageCount || Infinity, maxPages);
+    for (let p = 1; p <= total; p++) {
+      const url = ch.pageUrl(p);
+      let html = '';
+      diag.requests += 1;
+      try {
+        const { status, headers, buf } = await getHtml(url);
+        if (status !== 200) throw new Error(`HTTP ${status}`);
+        diag.success += 1;
+        html = decode(buf, headers['content-type'] || '');
+      } catch (e) {
+        diag.failed += 1;
+        diag.lastError = `${url} ${e.message}`;
+        diag.errors.push(diag.lastError);
+        console.log(`[enum] ${ch.label} 第${p}页失败: ${e.message}`);
+        if (++emptyStreak >= 3) break;
+        continue;
+      }
+      const items = parseListPage(html, url, ch);
+      if (!items.length) {
+        emptyStreak += 1;
+        if (emptyStreak >= 3) break;
+        continue;
+      }
+      emptyStreak = 0;
+      let added = 0;
+      for (const it of items) {
+        if (since && it.publishDate && it.publishDate < since) continue;
+        localItems.push({ ...it, province, channel: ch.label });
+        added += 1;
+      }
+      diag.itemCount += added;
+      if (onPage) onPage(p, total, items.length);
+      await new Promise((r) => setTimeout(r, PAGE_GAP_MS));
+    }
+    diag.ok = diag.success > 0 && diag.itemCount > 0;
+    if (diag.success > 0 && diag.itemCount === 0 && !diag.lastError) diag.lastError = 'HTTP成功但未解析到详情链接（可能页面改版）';
+    return { diag, items: localItems };
+  }
+
+  if (ch.type === 'discover') {
+    diag.requests = 1;
+    try {
+      const dd = {};
+      const items = await discoverChannelItems(ch, Math.min(3, Number.isFinite(maxPages) ? maxPages : 3), dd);
+      diag.success = (dd.rootOk || 0) + (dd.entryOk || 0);
+      diag.failed = (dd.rootFailed || 0) + (dd.entryFailed || 0);
+      diag.requests = diag.success + diag.failed;
+      diag.errors = dd.errors || [];
+      diag.lastError = diag.errors[diag.errors.length - 1] || '';
+      diag.ok = (dd.rootOk || 0) > 0 && items.length > 0;
+      if ((dd.rootOk || 0) > 0 && items.length === 0 && !diag.lastError) diag.lastError = '入口可访问但未发现政策详情链接';
+      if (onPage) onPage(1, 1, items.length);
+      for (const it of items) {
+        if (since && it.publishDate && it.publishDate < since) continue;
+        localItems.push({ ...it, province, channel: ch.label });
+        diag.itemCount += 1;
+      }
+    } catch (e) {
+      diag.failed += 1;
+      diag.lastError = e.message;
+      diag.errors.push(e.message);
+      console.log(`[enum] ${ch.label} 自动发现失败: ${e.message}`);
+    }
+    return { diag, items: localItems };
+  }
+
+  if (ch.type === 'sitemap') {
+    diag.requests = 1;
+    try {
+      const xml = await loadOrFetchSitemap(ch.cachePath, ch.sitemapUrl);
+      diag.success = 1;
+      const items = parseSitemap(xml, ch.pathPrefixes || []);
+      diag.ok = items.length > 0;
+      if (!items.length) diag.lastError = 'sitemap 可访问但没有匹配政策路径';
+      if (onPage) onPage(1, 1, items.length);
+      for (const it of items) {
+        if (since && it.publishDate && it.publishDate < since) continue;
+        localItems.push({ ...it, title: it.title || '(无标题，需抓详情)', province, channel: ch.label });
+        diag.itemCount += 1;
+      }
+      await new Promise((r) => setTimeout(r, PAGE_GAP_MS));
+    } catch (e) {
+      diag.failed = 1;
+      diag.lastError = e.message;
+      diag.errors.push(e.message);
+      console.log(`[enum] ${ch.label} sitemap 失败: ${e.message}`);
+    }
+    return { diag, items: localItems };
+  }
+
+  diag.failed = 1;
+  diag.lastError = `未知 channel type: ${ch.type}`;
+  diag.errors.push(diag.lastError);
+  console.log(`[enum] ${diag.lastError}`);
+  return { diag, items: localItems };
+}
+
+async function enumerateProvinceDetailed(province, opts = {}) {
   const channels = PROVINCE_CHANNELS[province];
   if (!channels || !channels.length) throw new Error(`未注册省份栏目源: ${province}（现有: ${Object.keys(PROVINCE_CHANNELS).join('/')}）`);
-  const { maxPages = Infinity, since = '', onPage } = opts;
+
+  // 同一省的多个栏目有限并发，避免坏 URL 一个个累计 6~8 秒超时。
+  const results = await mapLimit(channels, CHANNEL_CONCURRENCY, (ch) => processChannel(province, ch, opts));
+  const diagnostics = [];
   const seen = new Map();
-  for (const ch of channels) {
-    if ((ch.type || 'page') === 'page') {
-      let emptyStreak = 0;
-      const total = Math.min(ch.pageCount || Infinity, maxPages);
-      for (let p = 1; p <= total; p++) {
-        const url = ch.pageUrl(p);
-        let html = '';
-        try {
-          const { status, headers, buf } = await getHtml(url);
-          if (status !== 200) throw new Error(`HTTP ${status}`);
-          html = decode(buf, headers['content-type'] || '');
-        } catch (e) {
-          console.log(`[enum] ${ch.label} 第${p}页失败: ${e.message}`);
-          if (++emptyStreak >= 3) break;
-          continue;
-        }
-        emptyStreak = 0;
-        const items = parseListPage(html, url, ch);
-        if (!items.length) {
-          if (++emptyStreak >= 3) break;
-          continue;
-        }
-        let added = 0;
-        for (const it of items) {
-          if (since && it.publishDate && it.publishDate < since) continue;
-          if (seen.has(it.url)) continue;
-          seen.set(it.url, { ...it, province, channel: ch.label });
-          added++;
-        }
-        if (onPage) onPage(p, total, items.length);
-        await new Promise((r) => setTimeout(r, PAGE_GAP_MS));
-      }
-    } else if (ch.type === 'sitemap') {
-      // sitemap 模式：缓存优先，一次性读全表
-      try {
-        const xml = await loadOrFetchSitemap(ch.cachePath, ch.sitemapUrl);
-        const items = parseSitemap(xml, ch.pathPrefixes || []);
-        if (onPage) onPage(1, 1, items.length);
-        for (const it of items) {
-          if (since && it.publishDate && it.publishDate < since) continue;
-          if (seen.has(it.url)) continue;
-          // sitemap 拿不到 title → 留空让后面详情抓取/分类时不漏
-          seen.set(it.url, { ...it, title: it.title || '(无标题，需抓详情)', province, channel: ch.label });
-        }
-        await new Promise((r) => setTimeout(r, PAGE_GAP_MS));
-      } catch (e) {
-        console.log(`[enum] ${ch.label} sitemap 失败: ${e.message}`);
-      }
-    } else {
-      console.log(`[enum] 未知 channel type: ${ch.type}`);
+  for (let i = 0; i < results.length; i++) {
+    const rr = results[i];
+    if (!rr.ok) {
+      diagnostics.push({ label: channels[i].label, type: channels[i].type || 'page', ok:false, requests:1, success:0, failed:1, itemCount:0, lastError:String(rr.error?.message || rr.error || 'channel failed'), errors:[String(rr.error?.message || rr.error || 'channel failed')] });
+      continue;
     }
+    diagnostics.push(rr.value.diag);
+    for (const it of rr.value.items || []) if (!seen.has(it.url)) seen.set(it.url, it);
   }
-  return [...seen.values()];
+
+  return {
+    items: [...seen.values()],
+    diagnostics,
+    ok: diagnostics.some((d) => d.ok),
+    allFailed: diagnostics.length > 0 && diagnostics.every((d) => !d.ok),
+  };
+}
+
+async function enumerateProvince(province, opts = {}) {
+  const result = await enumerateProvinceDetailed(province, opts);
+  return result.items;
 }
 
 /** 已注册省份列表 */
@@ -379,4 +511,4 @@ function registeredProvinces() {
   return Object.keys(PROVINCE_CHANNELS);
 }
 
-module.exports = { PROVINCE_CHANNELS, enumerateProvince, parseListPage, parseSitemap, loadOrFetchSitemap, registeredProvinces };
+module.exports = { PROVINCE_CHANNELS, enumerateProvince, enumerateProvinceDetailed, parseListPage, parseSitemap, loadOrFetchSitemap, registeredProvinces, extractAnchors, scoreEntry, discoverChannelItems };

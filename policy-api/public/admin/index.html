@@ -18,6 +18,17 @@
 </head>
 <body>
 
+<div id="run-banner" class="run-banner hidden" role="status" aria-live="polite">
+  <div class="rb-bar"><i id="rb-done" style="width:0%"></i><i id="rb-fail" style="width:0%"></i></div>
+  <div class="rb-row">
+    <span class="rb-pulse" aria-hidden="true"></span>
+    <span class="rb-label" id="rb-label">启动中…</span>
+    <span class="rb-cell" id="rb-cell">初始化子进程…</span>
+    <span class="rb-stats" id="rb-stats"></span>
+    <span class="rb-pct" id="rb-pct">0%</span>
+  </div>
+</div>
+
 <svg style="display:none" aria-hidden="true">
   <symbol id="i-home" viewBox="0 0 24 24"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9.5 21v-6h5v6"/></symbol>
   <symbol id="i-clip" viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="17" rx="2.5"/><path d="M9 4.5V3h6v1.5"/><path d="M9 11h6M9 15h4"/></symbol>
@@ -63,6 +74,7 @@
         <h1>采集审批工作台</h1>
       </div>
       <div class="tb-right">
+        <span class="pill version-pill">V4.3 批次闭环版 · 2026-09-09</span>
         <span id="llm-badge" class="pill mode-off" title="字段提取引擎状态"><svg width="12" height="12"><use href="#i-spark"/></svg><span id="llm-txt">本地规则模式</span></span>
         <button id="btnTheme" class="iconbtn" title="切换深浅主题">
           <svg class="i-sun"><use href="#i-sun"/></svg>
@@ -87,44 +99,66 @@
       <div class="alayout">
         <!-- 左：矩阵巡检队列 + 一键巡检 -->
         <div class="acol acol-left">
-          <section class="card">
+          <section class="card" id="matrix-card">
             <div class="ch">
               <span class="cico"><svg><use href="#i-scale"/></svg></span>
-              <h3>矩阵巡检队列</h3>
-              <span class="chx"><span class="ptag">核心省 × 10 类</span></span>
+              <h3>区域批次巡检工作台</h3>
+              <span class="chx"><span id="batch-scope" class="ptag">全部 · 416 组合</span></span>
             </div>
             <div class="cb">
+              <div class="mode-switch" id="mode-switch">
+                <button data-mode="daily" class="on">今日增量</button>
+                <button data-mode="initial">初始化补全</button>
+                <span id="mode-help">仅今天发布且通过质量和去重的新政策进入待审批</span>
+              </div>
+              <div class="region-tabs" id="region-tabs"></div>
               <div class="cstat">
                 <div class="cs"><b id="m-total">–</b><span>总组合</span></div>
+                <div class="cs run"><b id="m-running">–</b><span>运行中</span></div>
                 <div class="cs ok"><b id="m-done">–</b><span>已完成</span></div>
                 <div class="cs err"><b id="m-err">–</b><span>失败</span></div>
                 <div class="cs go"><b id="m-rest">–</b><span>待跑</span></div>
+                <div class="cs"><b id="m-paused">–</b><span>已暂停</span></div>
               </div>
               <div class="prog" title="绿=完成 · 红=失败 · 蓝=待跑">
                 <i id="pOk" class="p-ok" style="width:0%"></i><i id="pErr" class="p-err" style="width:0%"></i><i id="pGo" class="p-go" style="width:0%"></i>
               </div>
-              <div class="kvmini"><span>待确认池</span><b id="m-pending">–</b></div>
+              <div class="kvmini"><span title="已抓取去重，等待人工审批。今日新增＝今日【发布】的政策（与「今日增量」模式同口径），不是今日入池；今天刚爬进来的条目看列表里的 NEW 标记">待确认池（累计 / 今日新增）</span><b><span id="m-pending">–</span> / <span id="m-pending-today">–</span></b></div>
               <div class="kvmini"><span>待同步（写权限）</span><b id="m-outbox" class="alert">–</b></div>
               <p id="m-err-detail" class="hint err hidden"></p>
+              <details class="pipeline-box" open><summary>本轮采集流水</summary><div class="pipeline" id="pipeline"><button data-flow="discovered"><b>0</b><span>发现</span></button><i>→</i><button data-flow="dateFiltered"><b>0</b><span>日期过滤</span></button><i>→</i><button data-flow="qualityFiltered"><b>0</b><span>质量过滤</span></button><i>→</i><button data-flow="duplicates"><b>0</b><span>去重</span></button><i>→</i><button data-flow="accepted"><b>0</b><span>实际入池</span></button></div></details>
+              <details class="task-box" open><summary>展开当前批次矩阵任务 <span id="task-count"></span></summary><div id="task-list" class="task-list"></div></details>
+              <div id="run-controls-slot"></div>
             </div>
           </section>
 
-          <section class="card">
+          <section class="card" id="health-card">
+            <div class="ch">
+              <span class="cico violet"><svg><use href="#i-eye"/></svg></span>
+              <h3>来源问题中心</h3>
+              <span class="chx"><button id="btn-comp-next" class="mini-action" type="button">执行下一条补偿</button></span>
+            </div>
+            <div class="cb">
+              <div class="health-grid">
+                <button class="health-k" data-health="healthy"><b id="h-healthy">0</b><span>正常</span></button>
+                <button class="health-k" data-health="degraded"><b id="h-degraded">0</b><span>部分失败</span></button>
+                <button class="health-k" data-health="suspicious"><b id="h-suspicious">0</b><span>漏抓风险</span></button>
+                <button class="health-k" data-health="stale"><b id="h-stale">0</b><span>疑似停更</span></button>
+                <button class="health-k" data-health="down"><b id="h-down">0</b><span>不可用</span></button>
+                <button class="health-k" data-health="unknown"><b id="h-unknown">31</b><span>未验证</span></button>
+              </div>
+              <div class="kvmini"><span>待补偿任务</span><b id="h-comp">0</b></div>
+              <div id="health-list" class="health-list"><span class="hint">这里只展示需要处理的来源，并给出原因和建议动作</span></div>
+            </div>
+          </section>
+
+          <section class="card" id="run-card">
             <div class="ch">
               <span class="cico green"><svg><use href="#i-play"/></svg></span>
-              <h3>一键巡检</h3>
+              <h3>运行控制</h3>
               <span class="chx"><span id="run-state" class="hint"></span></span>
             </div>
             <div class="cb">
-              <div class="frow">
-                <label>批量</label>
-                <select id="run-limit">
-                  <option value="5">5 个组合</option>
-                  <option value="15" selected>15 个组合（默认）</option>
-                  <option value="30">30 个组合</option>
-                  <option value="99999">跑完全部剩余</option>
-                </select>
-              </div>
               <div class="frow">
                 <label>定向地区</label>
                 <select id="run-region"><option value="">（不限）</option></select>
@@ -133,10 +167,14 @@
                 <label>定向类别</label>
                 <select id="run-category"><option value="">（不限）</option></select>
               </div>
-              <button id="btn-run" class="btn btn-primary btn-block"><svg width="14" height="14"><use href="#i-play"/></svg>开始巡检一批（15组合）</button>
-              <button id="btn-run-all" class="btn btn-secondary btn-block" style="margin-top:8px"><svg width="14" height="14"><use href="#i-play"/></svg>全量巡检（260组合，约30分钟）</button>
+              <button id="btn-run" class="btn btn-primary btn-block"><svg width="14" height="14"><use href="#i-play"/></svg>运行当前地区批次全部剩余</button>
               <button id="btn-ai-expand" class="btn btn-accent btn-block" style="margin-top:8px"><svg width="14" height="14"><use href="#i-ai"/></svg>AI 智能发现（DeepSeek 生成变体词补搜）</button>
-              <button id="btn-stop" class="btn btn-danger btn-block hidden" style="margin-top:8px"><svg width="14" height="14"><use href="#i-stop"/></svg>停止巡检</button>
+              <button id="btn-stop" class="btn btn-danger btn-block hidden" style="margin-top:8px"><svg width="14" height="14"><use href="#i-stop"/></svg>停止当前巡检</button>
+              <div class="runprog hidden" id="runprog">
+                <div class="rp-top"><span id="runprog-label">准备中…</span><span id="runprog-pct" class="rp-pct">0%</span></div>
+                <div class="rp-bar"><i id="rp-done" class="rp-done" style="width:0%"></i><i id="rp-fail" class="rp-fail" style="width:0%"></i></div>
+                <div class="rp-sub" id="runprog-sub">选择地区后点「运行」开始巡检</div>
+              </div>
               <pre id="run-log" class="log hidden"></pre>
             </div>
           </section>
@@ -162,7 +200,8 @@
               <div class="ctrlgrp">
                 <label class="ctrllbl">排序</label>
                 <div class="ctrlbtns">
-                  <button class="ctrlbtn on" data-sort="date">发布日期</button>
+                  <button class="ctrlbtn on" data-sort="added">入池时间</button>
+                  <button class="ctrlbtn" data-sort="date">发布日期</button>
                   <button class="ctrlbtn" data-sort="relevance">相关度</button>
                   <button class="ctrlbtn" id="btnSortDir" title="切换升序/降序">↓</button>
                 </div>
@@ -200,7 +239,7 @@
             <div id="preview-empty" class="a-empty">
               <svg><use href="#i-grid"/></svg>
               从左侧选择一条待审批条目
-              <span class="hint">此处按目标多维表格列展示「建议值 / 依据 / 当前值」，可逐格修改后确认入库</span>
+              <span class="hint">此处按目标多维表格列展示写入值；有建议时展示依据，可逐格修改后确认入库</span>
             </div>
             <div id="preview" class="hidden">
               <div class="pv-head">

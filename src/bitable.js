@@ -26,6 +26,23 @@
 
 const FEISHU_BASE = 'https://open.feishu.cn';
 
+const FEISHU_HTTP_TIMEOUT_MS = Math.max(3000, parseInt(process.env.FEISHU_HTTP_TIMEOUT_MS || '12000', 10) || 12000);
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = FEISHU_HTTP_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`HTTP timeout ${timeoutMs}ms`)), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (e) {
+    if (e && (e.name === 'AbortError' || /abort|timeout/i.test(String(e.message || '')))) {
+      throw new Error(`请求超时（${Math.round(timeoutMs / 1000)}s）：${String(url)}`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** 与 policy-kb bitable.service.ts 的 POLICY_SOURCES 对齐：十类政策专题表 */
 const POLICY_SOURCES = [
   { category: '最低工资', appToken: 'PTRkbDSiWa4Xmts0rStcaS2Ynbe', tableId: 'tbl6zo6GH73o7HCo', viewId: 'vewYtzY205' },
@@ -76,7 +93,7 @@ class BitableClient {
     // 提前 120s 视为过期，避免临界点用上刚过期的 token
     if (this._token && this._tokenExpireAt > Date.now() + 120_000) return this._token;
     const url = new URL('/open-apis/auth/v3/tenant_access_token/internal', this.base);
-    const res = await fetch(url, {
+    const res = await fetchWithTimeout(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json; charset=utf-8' },
       body: JSON.stringify({ app_id: this.appId, app_secret: this.appSecret }),
@@ -109,7 +126,7 @@ class BitableClient {
         }
       }
     }
-    const res = await fetch(url, {
+    const res = await fetchWithTimeout(url, {
       method,
       headers: {
         Authorization: `Bearer ${token}`,

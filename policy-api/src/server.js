@@ -32,6 +32,14 @@ const fs = require('fs');
 // 加载 feishu-webapp/.env（含 FEISHU_APP_ID / FEISHU_APP_SECRET）
 require('dotenv').config({ path: path.join(__dirname, '..', '..', '.env') });
 
+// ─── P0 全局防崩溃：未捕获的 Promise rejection 不再直接退出进程 ───
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[policy-api] 未捕获的 Promise rejection（已拦截，不退出）:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[policy-api] 未捕获异常（已拦截，不退出）:', err);
+});
+
 const express = require('express');
 const { BitableClient } = require('../../src/bitable');
 const { POLICY_SOURCES } = require('./policy-sources');
@@ -288,8 +296,14 @@ if (fs.existsSync(path.join(adminDir, 'index.html'))) {
     '/admin',
     express.static(adminDir, {
       index: 'index.html',
-      maxAge: process.env.NODE_ENV === 'production' ? '1h' : 0,
-      etag: true,
+      maxAge: 0,
+      etag: false,
+      setHeaders: (res) => {
+        // 审批台是开发期高频改版页面，禁止任何缓存，避免浏览器留旧 admin.js/index.html
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+      },
     })
   );
   console.log(`[policy-api] 审批工作台已托管: /admin/`);
@@ -403,6 +417,15 @@ app.get('/api/health', (req, res) => {
   } catch (err) {
     res.status(500).json({ status: 'error', error: err.message });
   }
+});
+
+// POST /api/admin/shutdown → 优雅停止服务（本地 MOCK 或已登录可用）
+app.post('/api/admin/shutdown', (req, res) => {
+  const allowed = process.env.MOCK_LOGIN === 'true' || (req.user && req.user.id);
+  if (!allowed) return res.status(403).json({ error: 'forbidden' });
+  res.json({ ok: true, message: 'server shutting down' });
+  // 稍作延迟，确保响应先发回客户端再退出进程
+  setTimeout(() => process.exit(0), 300);
 });
 
 // GET /api/crawl/stats → 爬虫统计（无需鉴权）
